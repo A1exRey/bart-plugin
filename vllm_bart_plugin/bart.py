@@ -75,19 +75,24 @@ from vllm.model_executor.models.utils import (
     cast_overflow_tensors,
     maybe_prefix,
 )
-from vllm.multimodal import MULTIMODAL_REGISTRY, ModalityData
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
 from vllm.multimodal.parse import (
+    ModalityData,
     ModalityDataItems,
     ModalityDataParser,
     MultiModalDataItems,
     MultiModalDataParser,
     ProcessorBatchItems,
 )
+
+try:
+    from vllm.inputs import MultiModalDataDict
+except ImportError:
+    from vllm.multimodal.inputs import MultiModalDataDict  # type: ignore[no-redef]
 from vllm.multimodal.processing import (
     BaseProcessingInfo,
     EncDecMultiModalProcessor,
@@ -1041,7 +1046,7 @@ class BartMultiModalProcessor(EncDecMultiModalProcessor[BartProcessingInfo]):
     def create_encoder_prompt(
         self,
         prompt: str | list[int],
-        mm_data: MultiModalDataDict,
+        mm_items: MultiModalDataItems,
     ) -> str | list[int]:
         # vLLM compatibility:
         # - Legacy (<0.18): prompt is encoder text (str) — tokenize directly.
@@ -1064,7 +1069,7 @@ class BartMultiModalProcessor(EncDecMultiModalProcessor[BartProcessingInfo]):
     def create_decoder_prompt(
         self,
         prompt: str | list[int],
-        mm_data: MultiModalDataDict,
+        mm_items: MultiModalDataItems,
     ) -> str | list[int]:
         # The decoder prompt is the original prompt
         return prompt

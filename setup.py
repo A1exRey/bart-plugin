@@ -11,7 +11,7 @@ setup(
     packages=find_packages(),
     python_requires=">=3.10",
     install_requires=[
-        "vllm>=0.13.0,<=0.18",
+        "vllm>=0.13.0,<=0.19.1",
         "torch>=2.9.0",
         "transformers >= 4.56.0, < 5",
     ],
