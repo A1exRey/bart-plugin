@@ -26,9 +26,9 @@ classifiers = [
 ]
 
 dependencies = [
-    "vllm>=0.13.0,<=0.19.1",
+    "vllm>=0.13.0,<=0.21.0",
     "torch>=2.9.0",
-    "transformers>=4.56.0,<5",
+    "transformers>=4.56.0",
 ]
 
 [project.optional-dependencies]
