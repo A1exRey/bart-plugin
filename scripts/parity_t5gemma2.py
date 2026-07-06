@@ -61,10 +61,16 @@ def load_hf(model_name: str, device: str, dtype: str):
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        model_name, dtype=getattr(torch, dtype)
-    ).to(device)
+    # Load, then cast explicitly: Module.to(dtype) converts every floating
+    # parameter AND buffer, so nothing stays in the checkpoint dtype (some
+    # transformers versions leave stray bf16 tensors behind when only the
+    # from_pretrained dtype kwarg is used, crashing float32 runs with
+    # "mat1 and mat2 must have the same dtype").
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    model = model.to(device=device, dtype=getattr(torch, dtype))
     model.eval()
+    hf_dtypes = {p.dtype for p in model.parameters()}
+    print(f"HF model dtype(s): {sorted(str(d) for d in hf_dtypes)}")
     return tokenizer, model
 
 
