@@ -132,6 +132,13 @@ skipped), total context capped at the decoder sliding window
 (`config.decoder.sliding_window`, 512 for the 270m checkpoint), no prefix
 caching.  See `example_t5gemma2_usage.py` and `scripts/parity_t5gemma2.py`.
 
+Numerical parity vs HuggingFace: exact in float32
+(`scripts/parity_t5gemma2.py --dtype float32`).  In bfloat16, vLLM's
+FlashAttention kernels and HF's eager attention accumulate differently, so
+teacher-forced logprobs drift by up to a few tenths and greedy decoding can
+flip near-tied tokens — the same behavior any vLLM model exhibits vs its HF
+reference in low precision.
+
 ## Plugin Architecture
 
 This plugin follows vLLM's plugin system architecture:

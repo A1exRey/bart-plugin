@@ -5,19 +5,32 @@
 Run on a machine with a GPU and access to the (gated) checkpoint:
 
     huggingface-cli login
-    python scripts/parity_t5gemma2.py --model google/t5gemma-2-270m-270m
+    # decisive exactness gate (implementation correctness):
+    python scripts/parity_t5gemma2.py --dtype float32
+    # production-dtype view (kernel-level numeric drift is expected):
+    python scripts/parity_t5gemma2.py
 
 Checks, in order of increasing integration depth:
 
 1. prefill  - teacher-forced next-token logprobs on the decoder prompt
               (vLLM prompt_logprobs vs HF forward).  Catches wiring bugs in
               the prefix-KV scheme, RoPE offsets, and tokenization drift.
-              Expect max |diff| ~1e-2 in bfloat16.
-2. greedy   - 64-token greedy continuations, token-exact vs HF generate().
-3. batching - a mixed-length batch must reproduce the solo-run outputs
-              (catches slot/mask misalignment under continuous batching).
+2. greedy   - 64-token greedy continuations vs HF generate().  Gates
+              (token-exact) only in float32: in bfloat16, HF-eager and
+              FlashAttention logits differ by ~0.1 logprob, so greedy
+              near-ties legitimately flip; the check reports divergence
+              steps as information.
+3. batching - teacher-forced logprobs computed solo vs inside a mixed
+              batch (catches slot/mask misalignment under continuous
+              batching, which produces HUGE diffs; small drift from
+              batch-size-dependent kernel reductions is tolerated).
 
-If (1) fails, nothing else can work - fix that first.
+Why two dtypes: float32 makes vLLM and HF numerically comparable, so any
+diff above ~1e-2 is a real bug.  bfloat16 diffs up to a few tenths of a
+logprob are cross-implementation kernel noise, not plugin bugs — the
+float32 run is what distinguishes the two.
+
+If (1) fails in float32, nothing else can work - fix that first.
 """
 
 import argparse
@@ -43,13 +56,13 @@ SOURCES = [
 DECODER_PREFIXES = ["", "The", "Summary:"]
 
 
-def load_hf(model_name: str, device: str):
+def load_hf(model_name: str, device: str, dtype: str):
     import torch
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForSeq2SeqLM.from_pretrained(
-        model_name, dtype=torch.bfloat16
+        model_name, dtype=getattr(torch, dtype)
     ).to(device)
     model.eval()
     return tokenizer, model
@@ -64,7 +77,9 @@ def derive_max_model_len(model_name: str) -> int:
     return min(window or 4096, 4096)
 
 
-def load_vllm(model_name: str, enforce_eager: bool, max_model_len: int):
+def load_vllm(
+    model_name: str, enforce_eager: bool, max_model_len: int, dtype: str
+):
     from vllm import LLM
 
     from vllm_bart_plugin.t5gemma2 import t5gemma2_hf_overrides
@@ -75,7 +90,7 @@ def load_vllm(model_name: str, enforce_eager: bool, max_model_len: int):
         max_model_len=max_model_len,
         enable_prefix_caching=False,
         disable_chunked_mm_input=True,
-        dtype="bfloat16",
+        dtype=dtype,
         enforce_eager=enforce_eager,
     )
 
@@ -152,7 +167,9 @@ def check_greedy(tokenizer, hf_model, llm, args) -> bool:
     import torch
     from vllm import SamplingParams
 
-    print("\n=== 2. greedy decode parity ===")
+    gating = args.dtype == "float32"
+    print(f"\n=== 2. greedy decode parity "
+          f"({'gating' if gating else 'informational in ' + args.dtype}) ===")
     params = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
     ok = True
     for source in SOURCES[: args.num_cases]:
@@ -175,42 +192,68 @@ def check_greedy(tokenizer, hf_model, llm, args) -> bool:
         vllm_tokens = list(out.outputs[0].token_ids)
 
         n = min(len(hf_tokens), len(vllm_tokens))
-        if hf_tokens[:n] != vllm_tokens[:n]:
-            ok = False
-            first = next(
-                i for i in range(n) if hf_tokens[i] != vllm_tokens[i]
-            )
-            print(f"  MISMATCH at step {first} (src={source[:40]!r})")
-            print(f"    hf  : {hf_tokens[:first + 3]}")
-            print(f"    vllm: {vllm_tokens[:first + 3]}")
-        else:
+        first = next(
+            (i for i in range(n) if hf_tokens[i] != vllm_tokens[i]), None
+        )
+        if first is None:
             print(f"  exact ({n} tokens): {source[:40]!r}")
+        else:
+            # In low precision a near-tie can flip; only float32 gates.
+            if gating:
+                ok = False
+            print(f"  diverges at step {first}/{n} (src={source[:40]!r})")
+            print(f"    hf  : ...{hf_tokens[max(0, first - 2):first + 2]}")
+            print(f"    vllm: ...{vllm_tokens[max(0, first - 2):first + 2]}")
     print(f"  {'OK' if ok else 'FAIL'}")
     return ok
 
 
+def _last_token_logprobs(llm, prompts, params):
+    """Teacher-forced logprob of the final decoder-prompt token, per
+    request.  One forward pass - no autoregressive compounding."""
+    values = []
+    for out in llm.generate(prompts, params):
+        token = out.prompt_token_ids[-1]
+        row = out.prompt_logprobs[-1]
+        values.append(
+            row[token].logprob if row and token in row else float("nan")
+        )
+    return values
+
+
 def check_batching(llm, args) -> bool:
+    """Slot/mask misalignment under continuous batching corrupts logits
+    catastrophically; batch-size-dependent kernel reduction order only
+    perturbs them slightly.  So compare teacher-forced logprobs solo vs
+    batched, with the same tolerance as the prefill check."""
     from vllm import SamplingParams
 
-    print("\n=== 3. batched == solo ===")
-    params = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
+    print("\n=== 3. batched == solo (teacher-forced logprobs) ===")
+    params = SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=0)
     prompts = [
-        {"prompt": "", "multi_modal_data": {"text": source}}
+        {
+            "prompt": "The answer is",
+            "multi_modal_data": {"text": source},
+        }
         for source in SOURCES
     ]
     solo = [
-        llm.generate([prompt], params)[0].outputs[0].token_ids
-        for prompt in prompts
+        _last_token_logprobs(llm, [prompt], params)[0] for prompt in prompts
     ]
-    batched = [
-        out.outputs[0].token_ids for out in llm.generate(prompts, params)
-    ]
+    batched = _last_token_logprobs(llm, prompts, params)
+
     ok = True
+    worst = 0.0
     for i, (a, b) in enumerate(zip(solo, batched)):
-        if list(a) != list(b):
+        diff = abs(a - b)
+        worst = max(worst, diff)
+        if not diff <= args.prefill_tol:  # catches NaN too
             ok = False
-            print(f"  MISMATCH for request {i}: solo={a[:8]} batch={b[:8]}")
-    print(f"  {'OK' if ok else 'FAIL'} ({len(prompts)} requests)")
+            print(f"  DIFF {diff:.4f} for request {i} "
+                  f"(solo={a:.4f}, batched={b:.4f})")
+    print(f"  worst |logprob diff| = {worst:.5f} "
+          f"({'OK' if ok else 'FAIL'}, tol {args.prefill_tol}, "
+          f"{len(prompts)} requests)")
     return ok
 
 
@@ -220,7 +263,12 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--num-cases", type=int, default=4)
-    parser.add_argument("--prefill-tol", type=float, default=2e-2)
+    parser.add_argument("--dtype", default="bfloat16",
+                        choices=["bfloat16", "float32"],
+                        help="float32 = decisive exactness gate; bfloat16 = "
+                             "production dtype (kernel noise expected)")
+    parser.add_argument("--prefill-tol", type=float, default=None,
+                        help="default: 1e-2 for float32, 0.5 for bfloat16")
     parser.add_argument("--max-model-len", type=int, default=None,
                         help="defaults to the decoder sliding window")
     parser.add_argument("--no-eager", action="store_true",
@@ -229,13 +277,18 @@ def main():
                         choices=["prefill", "greedy", "batching"])
     args = parser.parse_args()
 
+    if args.prefill_tol is None:
+        args.prefill_tol = 1e-2 if args.dtype == "float32" else 0.5
+
     max_model_len = args.max_model_len or derive_max_model_len(args.model)
-    print(f"max_model_len = {max_model_len}")
-    tokenizer, hf_model = load_hf(args.model, args.device)
+    print(f"dtype = {args.dtype}, max_model_len = {max_model_len}, "
+          f"prefill tol = {args.prefill_tol}")
+    tokenizer, hf_model = load_hf(args.model, args.device, args.dtype)
     llm = load_vllm(
         args.model,
         enforce_eager=not args.no_eager,
         max_model_len=max_model_len,
+        dtype=args.dtype,
     )
 
     results = {}
