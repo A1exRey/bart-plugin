@@ -39,9 +39,12 @@ Constraints enforced at load time (all with actionable errors):
 
 - ``hf_overrides=t5gemma2_hf_overrides`` (exported here) must be passed so
   vLLM treats the model as decoder-only.
-- ``max_model_len`` must not exceed the decoder's sliding window (4096 for
-  the 270m checkpoint): below it, sliding and full attention coincide and
-  the implementation is exact.  Longer contexts are a follow-up.
+- ``max_model_len`` must not exceed the decoder's sliding window (512 for
+  google/t5gemma-2-270m-270m — read ``config.decoder.sliding_window``):
+  below it, causal sliding and causal full attention coincide, so the
+  decoder is exact without configuring a sliding window.  Longer contexts
+  are a follow-up.  The encoder applies HF's real bidirectional sliding
+  masks and is exact at any length.
 - Prefix caching must be off and multimodal items must not be chunked, so a
   placeholder run always starts at position 0 within its scheduled chunk.
 
@@ -63,14 +66,10 @@ IS_LEGACY = False
 try:
     from vllm.v1.attention.backend import AttentionType
     from vllm.model_executor.layers.attention import Attention
-    from vllm.model_executor.layers.attention.mm_encoder_attention import (
-        MMEncoderAttention,
-    )
     from vllm.multimodal.processing.dummy_inputs import BaseDummyInputsBuilder
 except ImportError:  # pragma: no cover - legacy path not supported here
     from vllm.attention.backends.abstract import AttentionType
     from vllm.attention.layer import Attention
-    from vllm.attention.layers.mm_encoder_attention import MMEncoderAttention
     from vllm.multimodal.profiling import BaseDummyInputsBuilder
 
     IS_LEGACY = True
@@ -313,13 +312,32 @@ class _T5Gemma2AttentionBase(nn.Module):
         return q, k, v
 
 
+def bidirectional_sliding_window_mask(
+    num_tokens: int, sliding_window: int, device=None
+) -> torch.Tensor:
+    """HF's bidirectional sliding-window mask (True = may attend).
+
+    Mirrors ``sliding_window_mask_function(w, is_causal=False)`` from the HF
+    reference: token i attends to token j iff
+    ``0 <= i-j < (w+1)//2  or  0 < j-i < w//2 + 1``.
+    Note the window is split into a look-behind and a look-ahead half, so
+    this differs from full attention as soon as the input exceeds ~w/2
+    tokens.
+    """
+    left = (sliding_window + 1) // 2
+    right = sliding_window // 2 + 1
+    idx = torch.arange(num_tokens, device=device)
+    dist = idx[:, None] - idx[None, :]  # q_idx - kv_idx
+    return ((dist >= 0) & (dist < left)) | ((dist < 0) & (-dist < right))
+
+
 class T5Gemma2EncoderAttention(_T5Gemma2AttentionBase):
     """Bidirectional encoder self-attention.
 
-    Runs outside the KV cache (the encoder executes once per request inside
-    ``embed_multimodal``).  Plain full attention: under the enforced
-    ``max_model_len <= sliding_window`` cap, HF's bidirectional sliding
-    window mask coincides with full attention.
+    Runs densely outside the KV cache (the encoder executes once per request
+    inside ``embed_multimodal``), so the exact HF masks can be applied:
+    no mask on full-attention layers, the bidirectional sliding-window mask
+    on sliding layers.  This is exact for any encoder length.
     """
 
     def __init__(self, text_config, layer_idx, quant_config=None, prefix=""):
@@ -327,22 +345,39 @@ class T5Gemma2EncoderAttention(_T5Gemma2AttentionBase):
         if getattr(text_config, "attn_logit_softcapping", None) is not None:
             raise NotImplementedError(
                 "attn_logit_softcapping is not supported in the T5Gemma2 "
-                "encoder (MMEncoderAttention has no softcap)."
+                "encoder."
             )
-        self.attn = MMEncoderAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            prefix=f"{prefix}.attn",
-        )
+        self.is_sliding = self.layer_type == "sliding_attention"
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        sliding_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         q, k, v = self._project_qkv(hidden_states, positions)
-        out = self.attn(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))
-        out = out.squeeze(0)
+        num_tokens = hidden_states.shape[0]
+        q = q.view(1, num_tokens, self.num_heads, self.head_dim).transpose(
+            1, 2
+        )
+        k = k.view(1, num_tokens, self.num_kv_heads, self.head_dim).transpose(
+            1, 2
+        )
+        v = v.view(1, num_tokens, self.num_kv_heads, self.head_dim).transpose(
+            1, 2
+        )
+        groups = self.num_heads // self.num_kv_heads
+        if groups > 1:
+            k = k.repeat_interleave(groups, dim=1)
+            v = v.repeat_interleave(groups, dim=1)
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=sliding_mask if self.is_sliding else None,
+            scale=self.scaling,
+        )
+        out = out.transpose(1, 2).reshape(num_tokens, -1)
         out, _ = self.o_proj(out)
         return out
 
@@ -418,11 +453,14 @@ class T5Gemma2EncoderLayer(nn.Module):
         self.post_feedforward_layernorm = GemmaRMSNorm(hidden, eps=eps)
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        sliding_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.pre_self_attn_layernorm(hidden_states)
-        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states = self.self_attn(positions, hidden_states, sliding_mask)
         hidden_states = residual + self.post_self_attn_layernorm(hidden_states)
 
         residual = hidden_states
@@ -510,8 +548,17 @@ class T5Gemma2TextEncoder(nn.Module):
         self, input_ids: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
+        sliding_mask = None
+        window = self.config.sliding_window
+        if window is not None and any(
+            layer_type == "sliding_attention"
+            for layer_type in self.config.layer_types
+        ):
+            sliding_mask = bidirectional_sliding_window_mask(
+                input_ids.shape[0], window, device=hidden_states.device
+            )
         for layer in self.layers:
-            hidden_states = layer(positions, hidden_states)
+            hidden_states = layer(positions, hidden_states, sliding_mask)
         return self.norm(hidden_states)
 
 
@@ -774,6 +821,10 @@ _STACKED_WEIGHT_MAPPING = [
 ]
 
 
+_ENCODER_PREFIX = "model.encoder."
+_ENCODER_TEXT_PREFIX = "model.encoder.text_model."
+
+
 def map_t5gemma2_weight_name(
     name: str,
 ) -> tuple[str, str | int | None] | None:
@@ -782,6 +833,12 @@ def map_t5gemma2_weight_name(
     Returns None for weights that are intentionally skipped (vision tower).
     ``shard_id`` is None for plain 1:1 weights and a shard identifier for
     weights that load into a fused vLLM parameter (qkv_proj, gate_up_proj).
+
+    Both known checkpoint layouts are accepted: the transformers-5.13 module
+    tree nests the text encoder under ``model.encoder.text_model.*``, while
+    the Hub checkpoints (e.g. google/t5gemma-2-270m-270m) store it flat as
+    ``model.encoder.embed_tokens/layers/norm``.  Flat names are normalized
+    to the nested layout this plugin's module tree uses.
     """
     if name.startswith(_SKIP_WEIGHT_PREFIXES):
         return None
@@ -789,6 +846,10 @@ def map_t5gemma2_weight_name(
     # the module itself.
     if name.startswith("lm_head.out_proj."):
         name = name.replace("lm_head.out_proj.", "lm_head.")
+    if name.startswith(_ENCODER_PREFIX) and not name.startswith(
+        _ENCODER_TEXT_PREFIX
+    ):
+        name = _ENCODER_TEXT_PREFIX + name[len(_ENCODER_PREFIX):]
     for param_name, shard_name, shard_id in _STACKED_WEIGHT_MAPPING:
         if f".{shard_name}." in name:
             return name.replace(shard_name, param_name), shard_id

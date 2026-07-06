@@ -107,7 +107,7 @@ from vllm_bart_plugin.t5gemma2 import t5gemma2_hf_overrides
 llm = LLM(
     model="google/t5gemma-2-270m-270m",
     hf_overrides=t5gemma2_hf_overrides,  # route via the decoder-only path
-    max_model_len=4096,                  # <= decoder sliding window (exactness bound)
+    max_model_len=512,   # <= decoder sliding window (exactness bound; 512 for the 270m)
     enable_prefix_caching=False,
     disable_chunked_mm_input=True,
 )
@@ -125,10 +125,12 @@ T5Gemma 2's decoder fuses self- and cross-attention into a single softmax
 model on vLLM's decoder-only path with the encoder output injected as prefix
 rows of the paged KV cache — mathematically exact below the sliding-window
 bound (see `vllm_bart_plugin/t5gemma2.py` and `tests/test_t5gemma2_math.py`
-for the derivation and its proof against the HF reference).  Current
-limitations: text-only (the SigLIP vision tower is skipped), total context
-capped at the sliding window (4096), no prefix caching.  See
-`example_t5gemma2_usage.py` and `scripts/parity_t5gemma2.py`.
+for the derivation and its proof against the HF reference).  The encoder
+applies HF's exact bidirectional sliding-window masks and is exact at any
+length.  Current limitations: text-only (the SigLIP vision tower is
+skipped), total context capped at the decoder sliding window
+(`config.decoder.sliding_window`, 512 for the 270m checkpoint), no prefix
+caching.  See `example_t5gemma2_usage.py` and `scripts/parity_t5gemma2.py`.
 
 ## Plugin Architecture
 
@@ -172,7 +174,8 @@ Note: Florence-2 requires `trust_remote_code=True` and uses a separate tokenizer
 - `google/t5gemma-2-270m-270m` (gated; requires HF authentication)
 
 Note: requires `transformers>=5.0` and the settings shown in the usage
-section above (`hf_overrides=t5gemma2_hf_overrides`, `max_model_len<=4096`,
+section above (`hf_overrides=t5gemma2_hf_overrides`, `max_model_len` at
+most the decoder sliding window — 512 for the 270m checkpoint,
 `enable_prefix_caching=False`, `disable_chunked_mm_input=True`).
 
 ## Evaluation

@@ -9,8 +9,9 @@ mandatory and enforced by the model with clear errors:
 
 - ``hf_overrides=t5gemma2_hf_overrides`` (routes vLLM to the decoder-only
   path; the dict form ``{"is_encoder_decoder": False}`` works as well),
-- ``max_model_len <= 4096`` (the decoder sliding window; below it the
-  implementation is exact vs HuggingFace),
+- ``max_model_len`` at most the decoder's sliding window — 512 for
+  google/t5gemma-2-270m-270m (``config.decoder.sliding_window``); below it
+  the implementation is exact vs HuggingFace,
 - ``enable_prefix_caching=False`` and un-chunked multimodal input.
 
 Note: google/t5gemma-2-270m-270m is a gated model - run
@@ -26,7 +27,7 @@ def main():
     llm = LLM(
         model="google/t5gemma-2-270m-270m",
         hf_overrides=t5gemma2_hf_overrides,
-        max_model_len=4096,
+        max_model_len=512,  # = decoder sliding window of the 270m checkpoint
         enable_prefix_caching=False,
         disable_chunked_mm_input=True,
         dtype="bfloat16",

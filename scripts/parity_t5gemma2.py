@@ -55,7 +55,16 @@ def load_hf(model_name: str, device: str):
     return tokenizer, model
 
 
-def load_vllm(model_name: str, enforce_eager: bool):
+def derive_max_model_len(model_name: str) -> int:
+    """The plugin is exact up to the decoder's sliding window."""
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(model_name)
+    window = getattr(config.decoder, "sliding_window", None)
+    return min(window or 4096, 4096)
+
+
+def load_vllm(model_name: str, enforce_eager: bool, max_model_len: int):
     from vllm import LLM
 
     from vllm_bart_plugin.t5gemma2 import t5gemma2_hf_overrides
@@ -63,7 +72,7 @@ def load_vllm(model_name: str, enforce_eager: bool):
     return LLM(
         model=model_name,
         hf_overrides=t5gemma2_hf_overrides,
-        max_model_len=4096,
+        max_model_len=max_model_len,
         enable_prefix_caching=False,
         disable_chunked_mm_input=True,
         dtype="bfloat16",
@@ -212,14 +221,22 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--num-cases", type=int, default=4)
     parser.add_argument("--prefill-tol", type=float, default=2e-2)
+    parser.add_argument("--max-model-len", type=int, default=None,
+                        help="defaults to the decoder sliding window")
     parser.add_argument("--no-eager", action="store_true",
                         help="run vLLM with CUDA graphs enabled")
     parser.add_argument("--skip", nargs="*", default=[],
                         choices=["prefill", "greedy", "batching"])
     args = parser.parse_args()
 
+    max_model_len = args.max_model_len or derive_max_model_len(args.model)
+    print(f"max_model_len = {max_model_len}")
     tokenizer, hf_model = load_hf(args.model, args.device)
-    llm = load_vllm(args.model, enforce_eager=not args.no_eager)
+    llm = load_vllm(
+        args.model,
+        enforce_eager=not args.no_eager,
+        max_model_len=max_model_len,
+    )
 
     results = {}
     if "prefill" not in args.skip:

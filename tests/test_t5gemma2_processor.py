@@ -275,31 +275,43 @@ def test_weight_name_mapping_covers_real_hf_checkpoint_keys():
         | {"lm_head.weight"}
     )
 
-    seen_targets = set()
-    for key in hf_model.state_dict():
-        mapped = map_t5gemma2_weight_name(key)
-        if mapped is None:
-            assert key.startswith(
-                ("model.encoder.vision_tower.",
-                 "model.encoder.multi_modal_projector.")
-            ), f"unexpectedly skipped {key}"
-            continue
-        target, shard_id = mapped
-        assert target in valid_targets, (
-            f"HF key {key!r} mapped to unknown vLLM param {target!r}"
-        )
-        if target.endswith(("qkv_proj.weight", "gate_up_proj.weight")):
-            assert shard_id is not None
-        else:
-            assert shard_id is None
-        seen_targets.add(target)
+    # Check BOTH checkpoint layouts: the transformers-5.13 nested layout
+    # (model.encoder.text_model.*) and the flat layout used by the Hub
+    # checkpoints (model.encoder.*, as seen with google/t5gemma-2-270m-270m).
+    nested_keys = list(hf_model.state_dict())
+    flat_keys = [
+        key.replace("model.encoder.text_model.", "model.encoder.")
+        for key in nested_keys
+    ]
 
-    # Everything except possibly-tied embeddings must be covered by the
-    # checkpoint (tied weights are backfilled by load_weights).
-    tied_ok = {
-        "model.decoder.embed_tokens.weight",
-        "model.decoder.embed_tokens.eoi_embedding",
-        "lm_head.weight",
-    }
-    missing = valid_targets - seen_targets - tied_ok
-    assert not missing, f"vLLM params never produced by mapping: {missing}"
+    for keys in (nested_keys, flat_keys):
+        seen_targets = set()
+        for key in keys:
+            mapped = map_t5gemma2_weight_name(key)
+            if mapped is None:
+                assert key.startswith(
+                    ("model.encoder.vision_tower.",
+                     "model.encoder.multi_modal_projector.")
+                ), f"unexpectedly skipped {key}"
+                continue
+            target, shard_id = mapped
+            assert target in valid_targets, (
+                f"HF key {key!r} mapped to unknown vLLM param {target!r}"
+            )
+            if target.endswith(("qkv_proj.weight", "gate_up_proj.weight")):
+                assert shard_id is not None
+            else:
+                assert shard_id is None
+            seen_targets.add(target)
+
+        # Everything except possibly-tied embeddings must be covered by the
+        # checkpoint (tied weights are backfilled by load_weights).
+        tied_ok = {
+            "model.decoder.embed_tokens.weight",
+            "model.decoder.embed_tokens.eoi_embedding",
+            "lm_head.weight",
+        }
+        missing = valid_targets - seen_targets - tied_ok
+        assert not missing, (
+            f"vLLM params never produced by mapping: {missing}"
+        )

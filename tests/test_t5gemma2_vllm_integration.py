@@ -152,16 +152,13 @@ def _tiny_hf_model():
     return hf_model.float(), config
 
 
-@pytest.fixture(scope="module")
-def loaded_models(vllm_cpu_env, monkeypatch_module):
-    """Tiny HF model + the vLLM plugin model loaded from its state dict."""
+def _build_vllm_shell(config, vllm_cpu_env):
     import vllm_bart_plugin.t5gemma2 as t5
-
-    hf_model, config = _tiny_hf_model()
-
-    monkeypatch_module.setattr(t5, "Attention", FakeCausalAttention)
-
     from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+    )
 
     with set_current_vllm_config(vllm_cpu_env):
         vllm_model = t5.T5Gemma2ForConditionalGeneration.__new__(
@@ -173,13 +170,6 @@ def loaded_models(vllm_cpu_env, monkeypatch_module):
             config, cache_config=None, quant_config=None, prefix="model"
         )
         vllm_model.placeholder_token_id = 98
-        from vllm.model_executor.layers.logits_processor import (
-            LogitsProcessor,
-        )
-        from vllm.model_executor.layers.vocab_parallel_embedding import (
-            ParallelLMHead,
-        )
-
         vllm_model.lm_head = ParallelLMHead(
             config.decoder.vocab_size,
             config.decoder.hidden_size,
@@ -190,14 +180,30 @@ def loaded_models(vllm_cpu_env, monkeypatch_module):
             soft_cap=config.decoder.final_logit_softcapping,
         )
         vllm_model._pending_prefix_mask = None
+    return vllm_model
 
-    loaded = vllm_model.load_weights(hf_model.state_dict().items())
+
+def _load_and_check(vllm_model, weights):
+    loaded = vllm_model.load_weights(weights)
     # Everything in the vLLM tree must have been covered (incl. tied).
     param_names = {name for name, _ in vllm_model.named_parameters()}
     missing = param_names - loaded
     assert not missing, f"params never loaded: {missing}"
-
     vllm_model.eval()
+    return vllm_model
+
+
+@pytest.fixture(scope="module")
+def loaded_models(vllm_cpu_env, monkeypatch_module):
+    """Tiny HF model + the vLLM plugin model loaded from its state dict."""
+    import vllm_bart_plugin.t5gemma2 as t5
+
+    hf_model, config = _tiny_hf_model()
+
+    monkeypatch_module.setattr(t5, "Attention", FakeCausalAttention)
+
+    vllm_model = _build_vllm_shell(config, vllm_cpu_env)
+    _load_and_check(vllm_model, hf_model.state_dict().items())
     return hf_model, vllm_model
 
 
@@ -221,6 +227,65 @@ def test_encoder_matches_hf(loaded_models):
         enc_ids[0], torch.arange(6)
     )
     torch.testing.assert_close(got, ref, rtol=2e-4, atol=2e-5)
+
+
+@torch.no_grad()
+def test_encoder_sliding_window_matches_hf(loaded_models):
+    """Inputs LONGER than half the sliding window: the bidirectional
+    sliding mask differs from full attention here (window=16 -> tokens see
+    only ~8 neighbours each way), so this catches a wrong/missing mask."""
+    hf_model, vllm_model = loaded_models
+    torch.manual_seed(13)
+    n = 14  # > window//2 = 8
+    enc_ids = torch.randint(3, 90, (1, n))
+
+    ref = hf_model.model.encoder(input_ids=enc_ids).last_hidden_state[0]
+    got = vllm_model.model.encoder.text_model(enc_ids[0], torch.arange(n))
+    torch.testing.assert_close(got, ref, rtol=2e-4, atol=2e-5)
+
+    # Sanity: the mask really is non-trivial at this length.
+    from vllm_bart_plugin.t5gemma2 import bidirectional_sliding_window_mask
+
+    mask = bidirectional_sliding_window_mask(n, 16)
+    assert not bool(mask.all())
+
+
+@torch.no_grad()
+def test_flat_checkpoint_layout_loads_identically(
+    loaded_models, vllm_cpu_env
+):
+    """The Hub checkpoints store the text encoder flat under model.encoder.*
+    (no text_model segment) — loading that layout must give the same model.
+    This reproduces the layout from the user's google/t5gemma-2-270m-270m
+    load failure."""
+    hf_model, vllm_model = loaded_models
+
+    flat_weights = []
+    for name, tensor in hf_model.state_dict().items():
+        # Keep vision keys under model.encoder.vision_tower as-is; flatten
+        # only the text_model segment, like the real checkpoint.
+        flat_weights.append(
+            (name.replace("model.encoder.text_model.", "model.encoder."),
+             tensor)
+        )
+    # The real checkpoint also omits the tied decoder/lm_head weights.
+    flat_weights = [
+        (name, tensor)
+        for name, tensor in flat_weights
+        if not name.startswith(("model.decoder.embed_tokens.", "lm_head."))
+    ]
+
+    other = _build_vllm_shell(vllm_model.config, vllm_cpu_env)
+    _load_and_check(other, flat_weights)
+
+    torch.manual_seed(14)
+    enc_ids = torch.randint(3, 90, (1, 7))
+    a = vllm_model.model.encoder.text_model(enc_ids[0], torch.arange(7))
+    b = other.model.encoder.text_model(enc_ids[0], torch.arange(7))
+    torch.testing.assert_close(a, b)
+    torch.testing.assert_close(
+        other.lm_head.weight, vllm_model.lm_head.weight
+    )
 
 
 @torch.no_grad()
