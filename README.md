@@ -94,6 +94,42 @@ for o in outputs:
 
 For Florence-2 vision-language models, see `example_florence2_usage.py`.
 
+### T5Gemma 2
+
+T5Gemma 2 (e.g. `google/t5gemma-2-270m-270m`, a gated model) is supported
+text-to-text.  It requires `transformers>=5.0`
+(`pip install vllm-bart-plugin[t5gemma2]`) and three mandatory settings:
+
+```python
+from vllm import LLM, SamplingParams
+from vllm_bart_plugin.t5gemma2 import t5gemma2_hf_overrides
+
+llm = LLM(
+    model="google/t5gemma-2-270m-270m",
+    hf_overrides=t5gemma2_hf_overrides,  # route via the decoder-only path
+    max_model_len=4096,                  # <= decoder sliding window (exactness bound)
+    enable_prefix_caching=False,
+    disable_chunked_mm_input=True,
+)
+
+# The encoder input is passed as a "text" multimodal item; the prompt is
+# the (optional) decoder prefix.
+outputs = llm.generate(
+    [{"prompt": "", "multi_modal_data": {"text": "Text to transform..."}}],
+    SamplingParams(temperature=0.0, max_tokens=64),
+)
+```
+
+T5Gemma 2's decoder fuses self- and cross-attention into a single softmax
+(merged attention), which has no direct vLLM primitive.  The plugin runs the
+model on vLLM's decoder-only path with the encoder output injected as prefix
+rows of the paged KV cache — mathematically exact below the sliding-window
+bound (see `vllm_bart_plugin/t5gemma2.py` and `tests/test_t5gemma2_math.py`
+for the derivation and its proof against the HF reference).  Current
+limitations: text-only (the SigLIP vision tower is skipped), total context
+capped at the sliding window (4096), no prefix caching.  See
+`example_t5gemma2_usage.py` and `scripts/parity_t5gemma2.py`.
+
 ## Plugin Architecture
 
 This plugin follows vLLM's plugin system architecture:
@@ -131,6 +167,14 @@ This plugin should work with any BART-based model from HuggingFace, including:
 
 Note: Florence-2 requires `trust_remote_code=True` and uses a separate tokenizer (`Isotr0py/Florence-2-tokenizer`).
 
+### T5Gemma 2 Models
+
+- `google/t5gemma-2-270m-270m` (gated; requires HF authentication)
+
+Note: requires `transformers>=5.0` and the settings shown in the usage
+section above (`hf_overrides=t5gemma2_hf_overrides`, `max_model_len<=4096`,
+`enable_prefix_caching=False`, `disable_chunked_mm_input=True`).
+
 ## Evaluation
 
 To evaluate the model on CNN/DailyMail summarization:
@@ -151,6 +195,9 @@ See `scripts/eval_cnn_dailymail.py` for more options and reference ROUGE scores.
 ## TODO
  - [ ] Support `MBartForConditionalGeneration`
  - [x] Support `Florence2ForConditionalGeneration`
+ - [x] Support `T5Gemma2ForConditionalGeneration` (text-to-text)
+ - [ ] T5Gemma2: image inputs (SigLIP vision tower)
+ - [ ] T5Gemma2: contexts beyond the sliding window, prefix caching
 
 ## Environment Variables
 

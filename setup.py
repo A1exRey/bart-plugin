@@ -10,11 +10,15 @@ setup(
     author_email="nick.lucche@redhat.com",
     packages=find_packages(),
     python_requires=">=3.10",
+    # Keep in sync with pyproject.toml (the authoritative metadata).
     install_requires=[
-        "vllm>=0.13.0,<=0.19.1",
+        "vllm>=0.13.0,<=0.24.0",
         "torch>=2.9.0",
-        "transformers >= 4.56.0, < 5",
+        "transformers>=4.56.0",
     ],
+    extras_require={
+        "t5gemma2": ["transformers>=5.0"],
+    },
     entry_points={
         "vllm.general_plugins": [
             "bart=vllm_bart_plugin:register_bart_model",
