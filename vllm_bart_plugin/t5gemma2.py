@@ -146,15 +146,16 @@ _check_transformers_version()
 def t5gemma2_hf_overrides(hf_config):
     """``hf_overrides`` callable that lets vLLM run T5Gemma2 decoder-only.
 
-    ``T5Gemma2Config`` hard-codes ``is_encoder_decoder=True`` and its strict
-    validator rejects the flag at construction time, so the dict form
-    ``hf_overrides={"is_encoder_decoder": False}`` cannot work.  Flipping the
-    attribute after construction is allowed, which is exactly what this
-    helper does::
+    Usage::
 
         from vllm_bart_plugin.t5gemma2 import t5gemma2_hf_overrides
         llm = LLM(model="google/t5gemma-2-270m-270m",
                   hf_overrides=t5gemma2_hf_overrides, ...)
+
+    The dict form ``hf_overrides={"is_encoder_decoder": False}`` works too
+    (vLLM applies it via ``config.update`` after construction, which the
+    strict ``T5Gemma2Config`` allows; only init-time kwargs are rejected)
+    and is the form to use with ``vllm serve --hf-overrides``.
 
     This only affects how vLLM routes the model (decoder-only multimodal
     path, which is what the prefix-KV scheme needs); the plugin still
@@ -855,12 +856,9 @@ class T5Gemma2ForConditionalGeneration(
         if model_config.is_encoder_decoder:
             raise ValueError(
                 "T5Gemma2 must run on vLLM's decoder-only path.  Pass "
-                "hf_overrides=t5gemma2_hf_overrides (from "
-                "vllm_bart_plugin.t5gemma2) when constructing the LLM, "
-                "e.g.:\n"
-                "    from vllm_bart_plugin.t5gemma2 import "
-                "t5gemma2_hf_overrides\n"
-                "    LLM(model=..., hf_overrides=t5gemma2_hf_overrides)"
+                'hf_overrides={"is_encoder_decoder": False} when '
+                "constructing the LLM (or the equivalent callable "
+                "vllm_bart_plugin.t5gemma2.t5gemma2_hf_overrides)."
             )
 
         decoder_config = config.decoder

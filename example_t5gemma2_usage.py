@@ -8,8 +8,7 @@ decoder-only path with the encoder input passed as a "text" multimodal item
 mandatory and enforced by the model with clear errors:
 
 - ``hf_overrides=t5gemma2_hf_overrides`` (routes vLLM to the decoder-only
-  path; the dict form ``{"is_encoder_decoder": False}`` does NOT work
-  because the HF config validates that flag at construction time),
+  path; the dict form ``{"is_encoder_decoder": False}`` works as well),
 - ``max_model_len <= 4096`` (the decoder sliding window; below it the
   implementation is exact vs HuggingFace),
 - ``enable_prefix_caching=False`` and un-chunked multimodal input.
