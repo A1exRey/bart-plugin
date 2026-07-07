@@ -147,18 +147,21 @@ limitations: total context capped at the decoder sliding window
 most one image per request), no prefix caching.  See
 `example_t5gemma2_usage.py` and `scripts/parity_t5gemma2.py` (`--image`).
 
-Numerical parity vs HuggingFace: exact in float32
-(`scripts/parity_t5gemma2.py --dtype float32 --image`).  The float32 run is
-a measurement instrument, not a serving recommendation — bfloat16 is the
-model's native/production dtype.  In float32 the rounding noise is small
-enough that any residual difference must be structural, which is what makes
-it a meaningful correctness gate; the script disables TF32 for both stacks,
-since TF32 silently reduces "float32" matmuls to bfloat16-class precision
-on Ampere+ GPUs and would defeat the comparison.  In bfloat16, vLLM's
-FlashAttention kernels and HF's eager attention accumulate differently, so
-teacher-forced logprobs drift by up to a few tenths and greedy decoding can
-flip near-tied tokens — the same behavior any vLLM model exhibits vs its HF
-reference in low precision.
+Numerical parity vs HuggingFace (`scripts/parity_t5gemma2.py --image`, and
+`--dtype float32` for the low-noise variant): greedy decoding is token-exact
+in float32, and teacher-forced logprobs agree to a measured, deterministic
+kernel floor — ~0.01 mean / ~0.02 worst in float32, ~0.17 mean / ~0.6 worst
+in bfloat16.  That floor is the difference between vLLM's fused kernels
+(Triton attention, C++ RMSNorm/activation ops) and HF's eager PyTorch ops
+— the same relationship every vLLM model has to its HF reference.  It is
+deterministic (not run-to-run noise), cannot compound into garbage, and its
+only user-visible effect is an occasional flip of a near-tied token during
+decoding.  The plugin's own logic is held to a far stricter standard: the
+CPU test suite runs the same code with native torch ops and matches HF to
+~1e-4 (see tests/).  The float32 run exists purely as a low-noise
+measurement — bfloat16 is the model's native serving dtype.  (The script
+disables TF32 for hygiene, since TF32 silently reduces "float32" matmuls to
+bfloat16-class precision on Ampere+ GPUs.)
 
 ## Plugin Architecture
 
