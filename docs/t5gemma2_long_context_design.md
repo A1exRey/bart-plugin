@@ -100,10 +100,14 @@ All in `vllm_bart_plugin/t5gemma2_long.py`; enabled by passing
   keep working within the window without long mode.  Corollary:
   FlashAttention kernels are fp16/bf16-only, so long mode cannot run in
   float32 on GPU at all — the float32 exactness proof for the two-pass
-  formulation is the CPU math suite (vs HF, ~1e-4), and the tightest GPU
-  gate for long mode is float16 (3 more mantissa bits than bf16, ~8x less
-  kernel noise); float32 GPU parity still gates short mode, which shares
-  all plumbing except the two passes.
+  formulation is the CPU math suite (vs HF, ~1e-4); float32 GPU parity
+  still gates short mode, which shares all plumbing except the two
+  passes.  float16 is NOT a usable alternative gate: Gemma-family
+  activations overflow fp16's range in both stacks (measured on the 270m:
+  universal NaN prompt logprobs, plus deceptive "greedy exact" results
+  because HF and vLLM degenerate identically on argmax-of-NaN).  The
+  long-mode GPU dtype is bfloat16, where all checks passed with greedy
+  token-exact beyond-window results.
 - `block_size == 16` (`== PREFIX_PAD`; the pass-B block-table slice must be
   whole blocks).
 - No speculative decoding, no quantized KV cache, prefix caching off
@@ -137,8 +141,9 @@ All in `vllm_bart_plugin/t5gemma2_long.py`; enabled by passing
   `shifted_block_table`.
 - `tests/test_t5gemma2_processor.py`: padded `is_embed` insertion, budget
   check including padding, override stash/idempotency, long-mode RoPE pin.
-- GPU (user-run): `scripts/parity_t5gemma2.py --long-context --dtype
-  float16` (tightest FA-compatible gate) and bfloat16; `--long-context
-  --image --num-images 2` for the multi-image case.  First bf16 results:
-  prefill/greedy/batching PASS with beyond-window sources (771/795 encoder
-  tokens vs the 512 window), greedy token-exact on both long sources.
+- GPU (user-run): `scripts/parity_t5gemma2.py --long-context` (bfloat16)
+  and `--long-context --image --num-images 2` for the multi-image case;
+  plus plain `--dtype float32` (short mode) for the shared plumbing.
+  Results: bf16 long-context prefill/greedy/batching PASS with
+  beyond-window sources (771/795 encoder tokens vs the 512 window),
+  greedy token-exact on both long sources; multi-image PASS.
