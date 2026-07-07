@@ -33,8 +33,10 @@ dependencies = [
 
 [project.optional-dependencies]
 # T5Gemma2 support needs the transformers 5.x model implementation.
+# >=5.7: long-context (beyond-sliding-window) HF references need the
+# cross-attention cache fix from transformers PR #45540 (issue #45521).
 t5gemma2 = [
-    "transformers>=5.0",
+    "transformers>=5.7",
 ]
 dev = [
     "pytest>=7.0",

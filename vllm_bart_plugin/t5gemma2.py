@@ -38,13 +38,19 @@ tests/test_t5gemma2_math.py.
 Constraints enforced at load time (all with actionable errors):
 
 - ``hf_overrides=t5gemma2_hf_overrides`` (exported here) must be passed so
-  vLLM treats the model as decoder-only.
-- ``max_model_len`` must not exceed the decoder's sliding window (512 for
-  google/t5gemma-2-270m-270m — read ``config.decoder.sliding_window``):
+  vLLM treats the model as decoder-only.  For contexts beyond the decoder's
+  sliding window (512 for google/t5gemma-2-270m-270m), pass
+  ``hf_overrides=t5gemma2_long_context_hf_overrides`` instead (also exported
+  here): the decoder then runs an exact two-pass attention at any length —
+  see t5gemma2_long.py.  Long mode additionally requires the FLASH_ATTN
+  backend, ``block_size=16``, no speculative decoding and an unquantized KV
+  cache; attention is excluded from full CUDA-graph capture (piecewise
+  graphs still work).
+- Without long mode, ``max_model_len`` must not exceed the sliding window:
   below it, causal sliding and causal full attention coincide, so the
-  decoder is exact without configuring a sliding window.  Longer contexts
-  are a follow-up.  The encoder applies HF's real bidirectional sliding
-  masks and is exact at any length.
+  decoder is exact without configuring a sliding window.  The encoder
+  applies HF's real bidirectional sliding masks and is exact at any length
+  in both modes.
 - Prefix caching must be off and multimodal items must not be chunked, so a
   placeholder run always starts at position 0 within its scheduled chunk.
 
@@ -54,8 +60,10 @@ Image input is supported: pass the encoder input as
 expanded by the HF processor into boi + mm_tokens_per_image (256)
 image-soft-tokens + eoi; the SigLIP tower + projector features replace those
 rows before the text encoder runs.  Under the 512-token window of the 270m
-checkpoint exactly one image fits (~262 encoder tokens), leaving ~240 tokens
-of generation budget.
+checkpoint exactly one image fits (~262 encoder tokens, ~240 tokens of
+generation budget); long-context mode lifts that limit — multiple
+``<start_of_image>`` markers (with matching ``images`` entries) simply make
+the encoder item longer.
 """
 
 import math
@@ -125,13 +133,33 @@ from vllm.multimodal.processing import (
     PromptInsertion,
     PromptUpdate,
 )
+
+try:
+    from vllm.multimodal.processing import PromptUpdateDetails
+except ImportError:  # pragma: no cover - legacy vLLM (no long mode anyway)
+    PromptUpdateDetails = None
 from vllm.sequence import IntermediateTensors
 
+from .t5gemma2_long import (
+    SLIDING_WINDOW_STASH_ATTR,
+    T5Gemma2PrefixAttention,
+    is_long_context_mode,
+    long_context_sliding_window,
+    t5gemma2_long_context_hf_overrides,
+)
 from .t5gemma2_prefix import (
+    PREFIX_PAD,
     PrefixContext,
     compute_prefix_rope_positions,
+    round_up,
     substitute_prefix_rows,
 )
+
+__all__ = [
+    "T5Gemma2ForConditionalGeneration",
+    "t5gemma2_hf_overrides",
+    "t5gemma2_long_context_hf_overrides",
+]
 
 logger = __import__("logging").getLogger(__name__)
 
@@ -414,23 +442,48 @@ class T5Gemma2MergedDecoderAttention(_T5Gemma2AttentionBase):
         prefix="",
     ):
         super().__init__(text_config, layer_idx, quant_config, prefix)
-        # No per_layer_sliding_window: under the enforced
-        # max_model_len <= sliding_window cap, causal-sliding == causal-full
-        # for the self half, and the cross half (the prefix rows) must never
-        # be masked out — which a real sliding window would do.
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            logits_soft_cap=getattr(
-                text_config, "attn_logit_softcapping", None
-            ),
-            prefix=f"{prefix}.attn",
-            attn_type=AttentionType.DECODER,
-        )
+        if hasattr(text_config, SLIDING_WINDOW_STASH_ATTR):
+            # Long-context mode: exact two-pass attention (prefix rows
+            # always visible + windowed causal self) at any length; the
+            # layer reports FullAttentionSpec so prefix blocks are never
+            # freed.  See t5gemma2_long.py.
+            window = getattr(text_config, SLIDING_WINDOW_STASH_ATTR)
+            self.attn = T5Gemma2PrefixAttention(
+                self_window=(
+                    window
+                    if self.layer_type == "sliding_attention"
+                    else None
+                ),
+                num_heads=self.num_heads,
+                head_size=self.head_dim,
+                scale=self.scaling,
+                num_kv_heads=self.num_kv_heads,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                logits_soft_cap=getattr(
+                    text_config, "attn_logit_softcapping", None
+                ),
+                prefix=f"{prefix}.attn",
+            )
+        else:
+            # No per_layer_sliding_window: under the enforced
+            # max_model_len <= sliding_window cap, causal-sliding ==
+            # causal-full for the self half, and the cross half (the prefix
+            # rows) must never be masked out — which a real sliding window
+            # would do.
+            self.attn = Attention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                num_kv_heads=self.num_kv_heads,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                logits_soft_cap=getattr(
+                    text_config, "attn_logit_softcapping", None
+                ),
+                prefix=f"{prefix}.attn",
+                attn_type=AttentionType.DECODER,
+            )
 
     def forward(
         self,
@@ -856,8 +909,12 @@ class T5Gemma2DummyInputsBuilder(
         num_texts = mm_counts.get("text", 0)
         if num_texts == 0:
             return {}
-        # Leave headroom for BOS/specials added by the tokenizer.
-        num_words = max(1, seq_len - 8)
+        # Leave headroom for BOS/specials added by the tokenizer, plus the
+        # KV-block padding of the placeholder run in long-context mode.
+        headroom = 8
+        if is_long_context_mode(self.info.ctx.model_config.hf_config):
+            headroom += PREFIX_PAD
+        num_words = max(1, seq_len - headroom)
         return {"text": " ".join(["word"] * num_words)}
 
 
@@ -889,12 +946,20 @@ class T5Gemma2MultiModalProcessor(
                 self.info.process_encoder_item(encoder_item)
             )
             max_model_len = self.info.ctx.model_config.max_model_len
-            if encoder_input_ids.shape[-1] >= max_model_len:
+            num_encoder_tokens = encoder_input_ids.shape[-1]
+            hf_config = self.info.ctx.model_config.hf_config
+            if is_long_context_mode(hf_config):
+                # The run is padded to a PREFIX_PAD multiple; at least the
+                # decoder BOS must still fit.
+                num_encoder_tokens = round_up(num_encoder_tokens, PREFIX_PAD)
+            if num_encoder_tokens >= max_model_len:
                 raise ValueError(
-                    f"The encoder input needs {encoder_input_ids.shape[-1]} "
-                    f"tokens but max_model_len is {max_model_len} (each "
-                    "image costs ~mm_tokens_per_image+6 tokens and the "
-                    "generated tokens share the same budget)."
+                    f"The encoder input needs {num_encoder_tokens} tokens "
+                    "(after padding to the KV-block boundary in "
+                    "long-context mode) "
+                    f"but max_model_len is {max_model_len} (each image "
+                    "costs ~mm_tokens_per_image+6 tokens and the generated "
+                    "tokens share the same budget)."
                 )
             result["encoder_input_ids"] = encoder_input_ids
             # Keep the batch dim so the batched("text") field sees one
@@ -947,8 +1012,11 @@ class T5Gemma2MultiModalProcessor(
 
         text_items = mm_items.get_items("text", T5Gemma2EncoderItems)
         placeholder = self.info.get_placeholder_token_id()
+        long_mode = is_long_context_mode(
+            self.info.ctx.model_config.hf_config
+        )
 
-        def get_insertion(item_idx: int) -> list[int]:
+        def get_insertion(item_idx: int):
             num_tokens = None
             try:
                 item_kwargs = out_mm_kwargs["text"][item_idx]
@@ -962,7 +1030,24 @@ class T5Gemma2MultiModalProcessor(
                     text_items.get(item_idx)
                 )
                 num_tokens = encoder_input_ids.shape[-1]
-            return [placeholder] * num_tokens
+            if not long_mode:
+                return [placeholder] * num_tokens
+
+            # Long-context mode: pad the run to a KV-block boundary so the
+            # decoder-self region starts on one.  Only the first
+            # ``num_tokens`` rows receive encoder embeddings (is_embed);
+            # the padding rows keep the placeholder-token embedding and
+            # are excluded from both attention passes.
+            num_padded = round_up(num_tokens, PREFIX_PAD)
+
+            def is_embed(tokenizer, full) -> torch.Tensor:
+                mask = torch.zeros(num_padded, dtype=torch.bool)
+                mask[:num_tokens] = True
+                return mask
+
+            return PromptUpdateDetails(
+                full=[placeholder] * num_padded, is_embed=is_embed
+            )
 
         return [
             PromptInsertion(
@@ -1077,6 +1162,11 @@ class T5Gemma2ForConditionalGeneration(
         # back-to-back).  Consumed (popped) by forward.
         self._pending_prefix_mask: torch.Tensor | None = None
 
+        # Long-context mode pads the placeholder run to a PREFIX_PAD
+        # multiple; the RoPE pin must round up identically (the first
+        # decoder token sits at absolute position N_pad).
+        self._prefix_pad = 1 if not is_long_context_mode(config) else PREFIX_PAD
+
     @staticmethod
     def _validate_vllm_config(vllm_config: VllmConfig) -> None:
         model_config = vllm_config.model_config
@@ -1095,15 +1185,54 @@ class T5Gemma2ForConditionalGeneration(
             layer_type == "sliding_attention"
             for layer_type in decoder_config.layer_types
         )
-        window = decoder_config.sliding_window
-        if has_sliding and window is not None:
-            if model_config.max_model_len > window:
+        window = long_context_sliding_window(config)
+        long_mode = is_long_context_mode(config)
+        if (
+            has_sliding
+            and window is not None
+            and not long_mode
+            and model_config.max_model_len > window
+        ):
+            raise ValueError(
+                "Without long-context mode the T5Gemma2 plugin is exact "
+                "only when the total context fits in the sliding window "
+                f"({window} tokens); got max_model_len="
+                f"{model_config.max_model_len}.  Either pass "
+                f"max_model_len<={window}, or enable long-context mode "
+                "with hf_overrides=vllm_bart_plugin.t5gemma2."
+                "t5gemma2_long_context_hf_overrides."
+            )
+
+        if long_mode:
+            if getattr(model_config, "is_mm_prefix_lm", None) is not True:
                 raise ValueError(
-                    "The T5Gemma2 plugin is exact only when the total "
-                    "context fits in the sliding window "
-                    f"({window} tokens); got max_model_len="
-                    f"{model_config.max_model_len}.  Pass "
-                    f"max_model_len<={window}."
+                    "T5Gemma2 long-context mode needs vLLM to republish "
+                    "multimodal ranges every step, but model_config."
+                    "is_mm_prefix_lm is not set — this vLLM predates the "
+                    "mm-prefix-LM runner support (need vLLM 0.24) or the "
+                    "overrides were applied partially.  Use "
+                    "hf_overrides=t5gemma2_long_context_hf_overrides on "
+                    "vLLM 0.24."
+                )
+            if getattr(vllm_config, "speculative_config", None) is not None:
+                raise ValueError(
+                    "T5Gemma2 long-context mode does not support "
+                    "speculative decoding (draft models build their own "
+                    "attention metadata without the prefix passes)."
+                )
+            cache_config = vllm_config.cache_config
+            block_size = getattr(cache_config, "block_size", None)
+            if block_size is not None and block_size != PREFIX_PAD:
+                raise ValueError(
+                    "T5Gemma2 long-context mode requires block_size="
+                    f"{PREFIX_PAD} (the prefix pad granularity); got "
+                    f"{block_size}."
+                )
+            cache_dtype = getattr(cache_config, "cache_dtype", "auto")
+            if cache_dtype not in ("auto", "bfloat16", "float16"):
+                raise ValueError(
+                    "T5Gemma2 long-context mode does not support "
+                    f"quantized KV cache (kv_cache_dtype={cache_dtype})."
                 )
 
         scheduler_config = vllm_config.scheduler_config
@@ -1291,7 +1420,9 @@ class T5Gemma2ForConditionalGeneration(
         if not bool(mask.any()):
             return None
 
-        rope_positions = compute_prefix_rope_positions(mask, positions)
+        rope_positions = compute_prefix_rope_positions(
+            mask, positions, pad_multiple=self._prefix_pad
+        )
         enc_rows = inputs_embeds[mask]
         return PrefixContext(
             is_prefix=mask, enc_rows=enc_rows, rope_positions=rope_positions
