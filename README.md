@@ -94,6 +94,75 @@ for o in outputs:
 
 For Florence-2 vision-language models, see `example_florence2_usage.py`.
 
+### T5Gemma 2
+
+T5Gemma 2 (e.g. `google/t5gemma-2-270m-270m`, a gated model) is supported
+text-to-text.  It requires `transformers>=5.0`
+(`pip install vllm-bart-plugin[t5gemma2]`) and three mandatory settings:
+
+```python
+from vllm import LLM, SamplingParams
+from vllm_bart_plugin.t5gemma2 import t5gemma2_hf_overrides
+
+llm = LLM(
+    model="google/t5gemma-2-270m-270m",
+    hf_overrides=t5gemma2_hf_overrides,  # route via the decoder-only path
+    max_model_len=512,   # <= decoder sliding window (exactness bound; 512 for the 270m)
+    enable_prefix_caching=False,
+    disable_chunked_mm_input=True,
+)
+
+# The encoder input is passed as a "text" multimodal item; the prompt is
+# the (optional) decoder prefix.
+outputs = llm.generate(
+    [{"prompt": "", "multi_modal_data": {"text": "Text to transform..."}}],
+    SamplingParams(temperature=0.0, max_tokens=64),
+)
+
+# Images: the encoder item carries text and images together; each image
+# needs one <start_of_image> marker in the text and costs
+# ~mm_tokens_per_image+6 (~262) encoder tokens, so exactly ONE image fits
+# the 270m checkpoint's 512-token window.
+outputs = llm.generate(
+    [{
+        "prompt": "",
+        "multi_modal_data": {
+            "text": {"text": "<start_of_image>", "images": [pil_image]},
+        },
+    }],
+    SamplingParams(temperature=0.0, max_tokens=64),
+)
+```
+
+T5Gemma 2's decoder fuses self- and cross-attention into a single softmax
+(merged attention), which has no direct vLLM primitive.  The plugin runs the
+model on vLLM's decoder-only path with the encoder output injected as prefix
+rows of the paged KV cache — mathematically exact below the sliding-window
+bound (see `vllm_bart_plugin/t5gemma2.py` and `tests/test_t5gemma2_math.py`
+for the derivation and its proof against the HF reference).  The encoder
+applies HF's exact bidirectional sliding-window masks and is exact at any
+length.  Image input (SigLIP tower) is supported as shown above.  Current
+limitations: total context capped at the decoder sliding window
+(`config.decoder.sliding_window`, 512 for the 270m checkpoint — hence at
+most one image per request), no prefix caching.  See
+`example_t5gemma2_usage.py` and `scripts/parity_t5gemma2.py` (`--image`).
+
+Numerical parity vs HuggingFace (`scripts/parity_t5gemma2.py --image`, and
+`--dtype float32` for the low-noise variant): greedy decoding is token-exact
+in float32, and teacher-forced logprobs agree to a measured, deterministic
+kernel floor — ~0.01 mean / ~0.02 worst in float32, ~0.17 mean / ~0.6 worst
+in bfloat16.  That floor is the difference between vLLM's fused kernels
+(Triton attention, C++ RMSNorm/activation ops) and HF's eager PyTorch ops
+— the same relationship every vLLM model has to its HF reference.  It is
+deterministic (not run-to-run noise), cannot compound into garbage, and its
+only user-visible effect is an occasional flip of a near-tied token during
+decoding.  The plugin's own logic is held to a far stricter standard: the
+CPU test suite runs the same code with native torch ops and matches HF to
+~1e-4 (see tests/).  The float32 run exists purely as a low-noise
+measurement — bfloat16 is the model's native serving dtype.  (The script
+disables TF32 for hygiene, since TF32 silently reduces "float32" matmuls to
+bfloat16-class precision on Ampere+ GPUs.)
+
 ## Plugin Architecture
 
 This plugin follows vLLM's plugin system architecture:
@@ -131,6 +200,15 @@ This plugin should work with any BART-based model from HuggingFace, including:
 
 Note: Florence-2 requires `trust_remote_code=True` and uses a separate tokenizer (`Isotr0py/Florence-2-tokenizer`).
 
+### T5Gemma 2 Models
+
+- `google/t5gemma-2-270m-270m` (gated; requires HF authentication)
+
+Note: requires `transformers>=5.0` and the settings shown in the usage
+section above (`hf_overrides=t5gemma2_hf_overrides`, `max_model_len` at
+most the decoder sliding window — 512 for the 270m checkpoint,
+`enable_prefix_caching=False`, `disable_chunked_mm_input=True`).
+
 ## Evaluation
 
 To evaluate the model on CNN/DailyMail summarization:
@@ -151,6 +229,9 @@ See `scripts/eval_cnn_dailymail.py` for more options and reference ROUGE scores.
 ## TODO
  - [ ] Support `MBartForConditionalGeneration`
  - [x] Support `Florence2ForConditionalGeneration`
+ - [x] Support `T5Gemma2ForConditionalGeneration` (text-to-text)
+ - [x] T5Gemma2: image inputs (SigLIP vision tower; one image per request under the 512-token window)
+ - [ ] T5Gemma2: contexts beyond the sliding window (enables multi-image), prefix caching
 
 ## Environment Variables
 

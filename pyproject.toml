@@ -32,6 +32,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# T5Gemma2 support needs the transformers 5.x model implementation.
+t5gemma2 = [
+    "transformers>=5.0",
+]
 dev = [
     "pytest>=7.0",
     "black>=22.0",
