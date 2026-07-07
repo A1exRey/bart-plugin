@@ -148,7 +148,13 @@ most one image per request), no prefix caching.  See
 `example_t5gemma2_usage.py` and `scripts/parity_t5gemma2.py` (`--image`).
 
 Numerical parity vs HuggingFace: exact in float32
-(`scripts/parity_t5gemma2.py --dtype float32`).  In bfloat16, vLLM's
+(`scripts/parity_t5gemma2.py --dtype float32 --image`).  The float32 run is
+a measurement instrument, not a serving recommendation — bfloat16 is the
+model's native/production dtype.  In float32 the rounding noise is small
+enough that any residual difference must be structural, which is what makes
+it a meaningful correctness gate; the script disables TF32 for both stacks,
+since TF32 silently reduces "float32" matmuls to bfloat16-class precision
+on Ampere+ GPUs and would defeat the comparison.  In bfloat16, vLLM's
 FlashAttention kernels and HF's eager attention accumulate differently, so
 teacher-forced logprobs drift by up to a few tenths and greedy decoding can
 flip near-tied tokens — the same behavior any vLLM model exhibits vs its HF
