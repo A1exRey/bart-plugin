@@ -135,8 +135,13 @@ def _tiny_hf_model():
             text_config=T5Gemma2TextConfig(**text_kwargs),
             vision_config=vision_kwargs,
             mm_tokens_per_image=4,
+            boi_token_index=96,
+            eoi_token_index=98,
         ),
         decoder=T5Gemma2DecoderConfig(**text_kwargs),
+        # Must fit the tiny vocab; the top-level value overwrites the
+        # encoder's image_token_index in __post_init__ (HF behavior).
+        image_token_index=97,
     )
     hf_model = HFModel(config)
     hf_model.config._attn_implementation = "eager"
@@ -169,7 +174,7 @@ def _build_vllm_shell(config, vllm_cpu_env):
         vllm_model.model = t5.T5Gemma2Model(
             config, cache_config=None, quant_config=None, prefix="model"
         )
-        vllm_model.placeholder_token_id = 98
+        vllm_model.placeholder_token_id = config.image_token_index
         vllm_model.lm_head = ParallelLMHead(
             config.decoder.vocab_size,
             config.decoder.hidden_size,
@@ -248,6 +253,73 @@ def test_encoder_sliding_window_matches_hf(loaded_models):
 
     mask = bidirectional_sliding_window_mask(n, 16)
     assert not bool(mask.all())
+
+
+def _image_encoder_ids(config, num_text: int = 4) -> torch.Tensor:
+    """Encoder ids with one image block: text, boi, 4x image token, eoi."""
+    torch.manual_seed(21)
+    text_ids = torch.randint(3, 90, (num_text,))
+    boi = config.encoder.boi_token_index
+    eoi = config.encoder.eoi_token_index
+    image = config.image_token_index
+    block = torch.tensor([boi] + [image] * 4 + [eoi])
+    return torch.cat([torch.tensor([2]), text_ids[:2], block, text_ids[2:]])
+
+
+@torch.no_grad()
+def test_encoder_with_image_matches_hf(loaded_models):
+    """embed_multimodal with pixel_values == HF encoder(input_ids, pixels)"""
+    hf_model, vllm_model = loaded_models
+    config = vllm_model.config
+    enc_ids = _image_encoder_ids(config)
+    torch.manual_seed(22)
+    pixels = torch.rand(1, 3, 14, 14)
+
+    ref = hf_model.model.encoder(
+        input_ids=enc_ids[None], pixel_values=pixels
+    ).last_hidden_state[0]
+    (got,) = vllm_model.embed_multimodal(
+        encoder_input_ids=enc_ids[None],
+        pixel_values=pixels[None],  # (num_items=1, n_img=1, 3, H, W)
+    )
+    torch.testing.assert_close(got, ref, rtol=2e-4, atol=2e-5)
+
+
+@torch.no_grad()
+def test_full_forward_with_image_matches_hf(loaded_models):
+    hf_model, vllm_model = loaded_models
+    config = vllm_model.config
+    enc_ids = _image_encoder_ids(config)
+    n = enc_ids.numel()
+    torch.manual_seed(23)
+    pixels = torch.rand(1, 3, 14, 14)
+    t = 3
+    dec_ids = torch.randint(3, 90, (1, t))
+
+    ref = hf_model(
+        input_ids=enc_ids[None],
+        pixel_values=pixels,
+        decoder_input_ids=dec_ids,
+    ).logits[0]
+
+    (enc_out,) = vllm_model.embed_multimodal(
+        encoder_input_ids=enc_ids[None], pixel_values=pixels[None]
+    )
+    input_ids = torch.cat(
+        [torch.full((n,), vllm_model.placeholder_token_id), dec_ids[0]]
+    )
+    is_mm = torch.zeros(n + t, dtype=torch.bool)
+    is_mm[:n] = True
+    inputs_embeds = vllm_model.embed_input_ids(
+        input_ids, multimodal_embeddings=[enc_out], is_multimodal=is_mm
+    )
+    hidden = vllm_model.forward(
+        input_ids=None,
+        positions=torch.arange(n + t),
+        inputs_embeds=inputs_embeds,
+    )
+    logits = vllm_model.compute_logits(hidden[n:])[:, : ref.shape[-1]]
+    torch.testing.assert_close(logits, ref, rtol=2e-4, atol=2e-4)
 
 
 @torch.no_grad()

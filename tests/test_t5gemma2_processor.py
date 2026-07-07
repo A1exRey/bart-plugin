@@ -33,28 +33,49 @@ class FakeTokenizer:
         }
 
 
-class FakeInfo:
-    def __init__(self, placeholder=262144):
-        self._tokenizer = FakeTokenizer()
-        self._placeholder = placeholder
+class FakeHFProcessor:
+    """Mimics Gemma3Processor: expands <start_of_image> into a 4-token
+    image block and returns pixel_values."""
 
-    def get_tokenizer(self):
-        return self._tokenizer
+    IMAGE_BLOCK = [255999, 262144, 262144, 262144, 262144, 256000]
 
-    def get_placeholder_token_id(self):
-        return self._placeholder
+    def __call__(self, text, images, return_tensors="pt"):
+        tokens = [2]  # BOS
+        parts = text.split("<start_of_image>")
+        for i, chunk in enumerate(parts):
+            tokens += [100 + j for j in range(len(chunk.split()))]
+            if i < len(parts) - 1:
+                tokens += self.IMAGE_BLOCK
+        return {
+            "input_ids": torch.tensor([tokens]),
+            "pixel_values": torch.zeros(len(images), 3, 14, 14),
+        }
 
-    def tokenize_encoder_text(self, text):
-        return self._tokenizer.encode(text, add_special_tokens=True)
+
+def _make_info(max_model_len=512):
+    from types import SimpleNamespace
+
+    from vllm_bart_plugin.t5gemma2 import T5Gemma2ProcessingInfo
+
+    info = T5Gemma2ProcessingInfo.__new__(T5Gemma2ProcessingInfo)
+    info.ctx = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=max_model_len)
+    )
+    # Shadow the ctx-dependent lookups with fakes; the methods under test
+    # (process_encoder_item, tokenize_encoder_text, ...) stay real.
+    info.get_tokenizer = FakeTokenizer  # class as zero-arg factory
+    info.get_hf_processor = lambda **kwargs: FakeHFProcessor()
+    info.get_placeholder_token_id = lambda: 262144
+    return info
 
 
-def _make_processor():
+def _make_processor(max_model_len=512):
     from vllm_bart_plugin.t5gemma2 import T5Gemma2MultiModalProcessor
 
     processor = T5Gemma2MultiModalProcessor.__new__(
         T5Gemma2MultiModalProcessor
     )
-    processor.info = FakeInfo()
+    processor.info = _make_info(max_model_len)
     return processor
 
 
@@ -66,9 +87,69 @@ def test_call_hf_processor_tokenizes_encoder_text_and_decoder_prompt():
     # encoder text: BOS + 3 words
     assert out["encoder_input_ids"].shape == (1, 4)
     assert out["encoder_input_ids"][0, 0].item() == 2
+    # text-only items carry an empty pixel tensor (uniform field set)
+    assert out["pixel_values"].shape == (1, 0, 3, 1, 1)
     # decoder prompt: BOS + 2 words
     assert out["input_ids"].shape == (1, 3)
     assert out["input_ids"][0, 0].item() == 2
+
+
+def test_call_hf_processor_with_image_item():
+    processor = _make_processor()
+    item = {"text": "caption this <start_of_image>", "images": [object()]}
+    out = processor._call_hf_processor("", {"texts": [item]}, {}, {})
+    # BOS + 2 words + boi + 4 image tokens + eoi = 9
+    assert out["encoder_input_ids"].shape == (1, 9)
+    assert out["encoder_input_ids"][0].tolist().count(262144) == 4
+    assert out["pixel_values"].shape == (1, 1, 3, 14, 14)
+
+
+def test_call_hf_processor_rejects_over_budget_encoder():
+    processor = _make_processor(max_model_len=6)
+    item = {"text": "caption this <start_of_image>", "images": [object()]}
+    with pytest.raises(ValueError, match="max_model_len"):
+        processor._call_hf_processor("", {"texts": [item]}, {}, {})
+
+
+def test_split_encoder_item_variants():
+    from vllm_bart_plugin.t5gemma2 import _split_encoder_item
+
+    assert _split_encoder_item("hi") == ("hi", [])
+    img = object()
+    assert _split_encoder_item({"text": "a", "images": [img]}) == ("a", [img])
+    assert _split_encoder_item({"text": "a"}) == ("a", [])
+    assert _split_encoder_item({"text": "a", "images": img}) == ("a", [img])
+    with pytest.raises(TypeError):
+        _split_encoder_item(42)
+
+
+def test_data_parser_accepts_str_and_dict_items():
+    from vllm_bart_plugin.t5gemma2 import T5Gemma2DataParser
+
+    parser = T5Gemma2DataParser()
+    assert parser._parse_text_data("hello").get_count() == 1
+    assert parser._parse_text_data(
+        {"text": "hello", "images": []}
+    ).get_count() == 1
+    with pytest.raises(TypeError):
+        parser._parse_text_data(3.14)
+
+
+def test_parse_pixel_values_shapes():
+    model = _make_model_shell()
+    # Stacked (num_items, n_img, 3, H, W)
+    parsed = model._parse_pixel_values(torch.zeros(2, 1, 3, 4, 4), 2)
+    assert parsed[0].shape == (1, 3, 4, 4)
+    # List with an extra leading batch dim and an empty entry
+    parsed = model._parse_pixel_values(
+        [torch.zeros(1, 2, 3, 4, 4), torch.zeros(0, 3, 1, 1)], 2
+    )
+    assert parsed[0].shape == (2, 3, 4, 4)
+    assert parsed[1] is None
+    # Absent
+    assert model._parse_pixel_values(None, 3) == [None, None, None]
+    with pytest.raises(ValueError, match="pixel_values items"):
+        model._parse_pixel_values([torch.zeros(1, 3, 4, 4)], 2)
 
 
 def test_call_hf_processor_accepts_pretokenized_decoder_prompt():
@@ -84,27 +165,53 @@ def test_call_hf_processor_empty_decoder_prompt_gets_bos():
     assert out["input_ids"].tolist() == [[2]]
 
 
+class FakeItems:
+    def __init__(self, item="one two three four"):
+        self._item = item
+
+    def get_count(self, modality, strict=True):
+        assert modality == "text"
+        return 1
+
+    def get_items(self, modality, typ):
+        return typ(self._item)
+
+
 def test_prompt_updates_insert_one_placeholder_per_encoder_token():
     from vllm.multimodal.processing import PromptInsertion
 
-    from vllm_bart_plugin.bart import TextProcessorItems
-
     processor = _make_processor()
-
-    class FakeItems:
-        def get_count(self, modality, strict=True):
-            assert modality == "text"
-            return 1
-
-        def get_items(self, modality, typ):
-            return TextProcessorItems("one two three four")
-
     (update,) = processor._get_prompt_updates(FakeItems(), {}, {})
     assert isinstance(update, PromptInsertion)
     assert update.modality == "text"
     insertion = update.content(0)
-    # BOS + 4 words = 5 encoder tokens -> 5 placeholders
+    # BOS + 4 words = 5 encoder tokens -> 5 placeholders (fallback path:
+    # empty out_mm_kwargs forces reprocessing)
     assert insertion == [262144] * 5
+
+
+def test_prompt_updates_prefer_processed_length_from_out_mm_kwargs():
+    from vllm.multimodal.inputs import (
+        MultiModalFieldElem,
+        MultiModalKwargsItem,
+        MultiModalKwargsItems,
+        MultiModalSharedField,
+    )
+
+    processor = _make_processor()
+    elem = MultiModalFieldElem(
+        data=torch.zeros(1, 7, dtype=torch.long),
+        field=MultiModalSharedField(batch_size=1),
+    )
+    out_mm_kwargs = MultiModalKwargsItems(
+        {"text": [MultiModalKwargsItem({"encoder_input_ids": elem})]}
+    )
+    (update,) = processor._get_prompt_updates(
+        FakeItems(), {}, out_mm_kwargs
+    )
+    # 7 comes from the processed tensor, not from retokenizing (which
+    # would give 5).
+    assert update.content(0) == [262144] * 7
 
 
 def test_prompt_updates_empty_without_text_items():
@@ -272,7 +379,12 @@ def test_weight_name_mapping_covers_real_hf_checkpoint_keys():
     valid_targets = (
         expected_names("encoder.text_model")
         | expected_names("decoder")
-        | {"lm_head.weight"}
+        | {
+            "lm_head.weight",
+            "model.encoder.multi_modal_projector."
+            "mm_input_projection_weight",
+            "model.encoder.multi_modal_projector.mm_soft_emb_norm.weight",
+        }
     )
 
     # Check BOTH checkpoint layouts: the transformers-5.13 nested layout
@@ -289,10 +401,11 @@ def test_weight_name_mapping_covers_real_hf_checkpoint_keys():
         for key in keys:
             mapped = map_t5gemma2_weight_name(key)
             if mapped is None:
-                assert key.startswith(
-                    ("model.encoder.vision_tower.",
-                     "model.encoder.multi_modal_projector.")
-                ), f"unexpectedly skipped {key}"
+                # Vision-tower weights are routed to SiglipVisionModel's
+                # own loader, not through the name mapping.
+                assert key.startswith("model.encoder.vision_tower."), (
+                    f"unexpectedly skipped {key}"
+                )
                 continue
             target, shard_id = mapped
             assert target in valid_targets, (

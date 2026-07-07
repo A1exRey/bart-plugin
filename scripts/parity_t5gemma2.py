@@ -263,6 +263,67 @@ def check_batching(llm, args) -> bool:
     return ok
 
 
+def check_image(tokenizer, hf_model, llm, args) -> bool:
+    """Greedy decode parity on a synthetic image (single image fits the
+    512-token window: ~262 encoder tokens).  Gates only in float32."""
+    import numpy as np
+    import torch
+    from PIL import Image
+    from transformers import AutoProcessor
+    from vllm import SamplingParams
+
+    gating = args.dtype == "float32"
+    print(f"\n=== 4. image decode parity "
+          f"({'gating' if gating else 'informational in ' + args.dtype}) ===")
+
+    rng = np.random.default_rng(0)
+    image = Image.fromarray(
+        rng.integers(0, 255, size=(224, 224, 3), dtype=np.uint8)
+    )
+    text = "<start_of_image>"
+
+    hf_processor = AutoProcessor.from_pretrained(args.model)
+    hf_inputs = hf_processor(text=text, images=[image], return_tensors="pt")
+    with torch.no_grad():
+        hf_out = hf_model.generate(
+            input_ids=hf_inputs["input_ids"].to(hf_model.device),
+            pixel_values=hf_inputs["pixel_values"].to(
+                hf_model.device, hf_model.dtype
+            ),
+            do_sample=False,
+            num_beams=1,
+            max_new_tokens=args.max_tokens,
+        )[0].tolist()
+    hf_tokens = hf_out[1:]  # drop decoder BOS
+
+    out = llm.generate(
+        [{
+            "prompt": "",
+            "multi_modal_data": {
+                "text": {"text": text, "images": [image]},
+            },
+        }],
+        SamplingParams(temperature=0.0, max_tokens=args.max_tokens),
+    )[0]
+    vllm_tokens = list(out.outputs[0].token_ids)
+
+    n = min(len(hf_tokens), len(vllm_tokens))
+    first = next(
+        (i for i in range(n) if hf_tokens[i] != vllm_tokens[i]), None
+    )
+    ok = True
+    if first is None:
+        print(f"  exact ({n} tokens)")
+    else:
+        if gating:
+            ok = False
+        print(f"  diverges at step {first}/{n}")
+        print(f"    hf  : ...{hf_tokens[max(0, first - 2):first + 2]}")
+        print(f"    vllm: ...{vllm_tokens[max(0, first - 2):first + 2]}")
+    print(f"  {'OK' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="google/t5gemma-2-270m-270m")
@@ -280,7 +341,9 @@ def main():
     parser.add_argument("--no-eager", action="store_true",
                         help="run vLLM with CUDA graphs enabled")
     parser.add_argument("--skip", nargs="*", default=[],
-                        choices=["prefill", "greedy", "batching"])
+                        choices=["prefill", "greedy", "batching", "image"])
+    parser.add_argument("--image", action="store_true",
+                        help="also check single-image decode parity")
     args = parser.parse_args()
 
     if args.prefill_tol is None:
@@ -304,6 +367,8 @@ def main():
         results["greedy"] = check_greedy(tokenizer, hf_model, llm, args)
     if "batching" not in args.skip:
         results["batching"] = check_batching(llm, args)
+    if args.image and "image" not in args.skip:
+        results["image"] = check_image(tokenizer, hf_model, llm, args)
 
     print("\n=== summary ===")
     for name, passed in results.items():

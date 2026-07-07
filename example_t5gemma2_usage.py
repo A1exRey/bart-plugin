@@ -58,6 +58,31 @@ def main():
         print(f"Encoder input: {source[:80]}...")
         print(f"Generated:     {output.outputs[0].text!r}")
 
+    # Image input: the encoder item carries the text (with one
+    # <start_of_image> marker per image) and the images together.  One
+    # image costs ~262 encoder tokens, so exactly one fits the 512-token
+    # window of the 270m checkpoint.
+    try:
+        from PIL import Image
+
+        image = Image.new("RGB", (224, 224), color=(120, 180, 240))
+        image_outputs = llm.generate(
+            [{
+                "prompt": "",
+                "multi_modal_data": {
+                    "text": {
+                        "text": "<start_of_image>",
+                        "images": [image],
+                    },
+                },
+            }],
+            sampling_params,
+        )
+        print("=" * 70)
+        print(f"Image caption: {image_outputs[0].outputs[0].text!r}")
+    except ImportError:
+        print("pillow not installed; skipping the image example")
+
 
 if __name__ == "__main__":
     main()

@@ -48,8 +48,14 @@ Constraints enforced at load time (all with actionable errors):
 - Prefix caching must be off and multimodal items must not be chunked, so a
   placeholder run always starts at position 0 within its scheduled chunk.
 
-The SigLIP vision tower present in the checkpoints is skipped for now
-(text-to-text only); image support is a follow-up.
+Image input is supported: pass the encoder input as
+``multi_modal_data={"text": {"text": "caption: <start_of_image>",
+"images": [pil_image]}}``.  Each ``<start_of_image>`` marker in the text is
+expanded by the HF processor into boi + mm_tokens_per_image (256)
+image-soft-tokens + eoi; the SigLIP tower + projector features replace those
+rows before the text encoder runs.  Under the 512-token window of the 270m
+checkpoint exactly one image fits (~262 encoder tokens), leaving ~240 tokens
+of generation budget.
 """
 
 import math
@@ -107,7 +113,11 @@ from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
-from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
+from vllm.multimodal.parse import (
+    MultiModalDataItems,
+    MultiModalDataParser,
+    ProcessorBatchItems,
+)
 from vllm.multimodal.processing import (
     BaseMultiModalProcessor,
     BaseProcessingInfo,
@@ -515,6 +525,47 @@ class T5Gemma2DecoderLayer(nn.Module):
         return hidden_states
 
 
+class T5Gemma2MultiModalProjector(nn.Module):
+    """SigLIP patch features -> mm_tokens_per_image text-space embeddings.
+
+    Mirrors HF's T5Gemma2MultiModalProjector (identical to Gemma3's):
+    average-pool the patch grid down to tokens_per_side^2 tokens, RMSNorm
+    over the vision hidden dim, then project into the text hidden dim.
+    """
+
+    def __init__(self, encoder_config):
+        super().__init__()
+        vision_config = encoder_config.vision_config
+        text_hidden_size = encoder_config.text_config.hidden_size
+        self.mm_input_projection_weight = nn.Parameter(
+            torch.zeros(vision_config.hidden_size, text_hidden_size)
+        )
+        self.mm_soft_emb_norm = GemmaRMSNorm(
+            vision_config.hidden_size, eps=vision_config.layer_norm_eps
+        )
+        self.patches_per_image = int(
+            vision_config.image_size // vision_config.patch_size
+        )
+        self.tokens_per_side = int(encoder_config.mm_tokens_per_image**0.5)
+        self.kernel_size = self.patches_per_image // self.tokens_per_side
+        self.avg_pool = nn.AvgPool2d(
+            kernel_size=self.kernel_size, stride=self.kernel_size
+        )
+
+    def forward(self, vision_outputs: torch.Tensor) -> torch.Tensor:
+        batch_size, _, hidden_size = vision_outputs.shape
+        x = vision_outputs.transpose(1, 2).reshape(
+            batch_size,
+            hidden_size,
+            self.patches_per_image,
+            self.patches_per_image,
+        ).contiguous()
+        x = self.avg_pool(x).flatten(2).transpose(1, 2)
+        x = self.mm_soft_emb_norm(x)
+        x = torch.matmul(x, self.mm_input_projection_weight)
+        return x.type_as(vision_outputs)
+
+
 class T5Gemma2TextEncoder(nn.Module):
     """The bidirectional text encoder; weight path encoder.text_model.*"""
 
@@ -545,9 +596,15 @@ class T5Gemma2TextEncoder(nn.Module):
         )
 
     def forward(
-        self, input_ids: torch.Tensor, positions: torch.Tensor
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_tokens(input_ids)
         sliding_mask = None
         window = self.config.sliding_window
         if window is not None and any(
@@ -563,23 +620,35 @@ class T5Gemma2TextEncoder(nn.Module):
 
 
 class T5Gemma2Encoder(nn.Module):
-    """Container matching HF's encoder module tree (text_model + vision).
-
-    The SigLIP vision tower and projector are intentionally not instantiated:
-    their weights are skipped at load time and image inputs are rejected by
-    the processor ({"text": 1} limits).  Text-only for now.
-    """
+    """The multimodal encoder, matching HF's module tree: a bidirectional
+    text encoder plus a SigLIP vision tower whose (pooled, projected)
+    features replace the image-soft-token rows of the text embeddings."""
 
     def __init__(
         self, encoder_config, eoi_token_index, quant_config=None, prefix=""
     ):
         super().__init__()
+        from vllm.model_executor.models.siglip import SiglipVisionModel
+
         self.text_model = T5Gemma2TextEncoder(
             encoder_config.text_config,
             eoi_token_index,
             quant_config,
             prefix=f"{prefix}.text_model",
         )
+        self.vision_tower = SiglipVisionModel(
+            encoder_config.vision_config,
+            quant_config,
+            prefix=f"{prefix}.vision_tower",
+        )
+        self.multi_modal_projector = T5Gemma2MultiModalProjector(
+            encoder_config
+        )
+
+    def get_image_features(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """(num_images, 3, H, W) -> (num_images, mm_tokens_per_image, T)"""
+        vision_outputs = self.vision_tower(pixel_values)
+        return self.multi_modal_projector(vision_outputs)
 
 
 class T5Gemma2Decoder(nn.Module):
@@ -651,14 +720,71 @@ class T5Gemma2Model(nn.Module):
 
 
 # --------------------------------------------------------------------------
-# Multimodal processing: encoder text as a "text" modality (bart.py pattern),
-# expanded into leading placeholder tokens of the (single, decoder) prompt.
+# Multimodal processing: the whole encoder input (text, optionally with
+# images) is ONE "text"-modality item, expanded into leading placeholder
+# tokens of the (single, decoder) prompt.  An item is either a plain string
+# or {"text": str, "images": [PIL.Image, ...]} — the images are part of the
+# item because the encoder consumes text and image soft tokens as a single
+# atomic sequence.
 # --------------------------------------------------------------------------
+
+
+def _split_encoder_item(item: object) -> tuple[str, list]:
+    """Normalize a "text" mm item to (text, images)."""
+    if isinstance(item, str):
+        return item, []
+    if isinstance(item, Mapping):
+        text = item.get("text", "")
+        images = item.get("images") or []
+        if not isinstance(text, str):
+            raise TypeError(f"'text' must be a string, got {type(text)}")
+        if not isinstance(images, (list, tuple)):
+            images = [images]
+        return text, list(images)
+    raise TypeError(
+        "T5Gemma2 'text' items must be a string or a "
+        "{'text': str, 'images': [...]} mapping, got " + str(type(item))
+    )
+
+
+class T5Gemma2EncoderItems(ProcessorBatchItems):
+    """Items of the "text" modality: str or {"text":..., "images": [...]}"""
+
+    def __init__(self, data) -> None:
+        if data is None:
+            data = [""]
+        elif isinstance(data, (str, Mapping)):
+            data = [data]
+        super().__init__(data, "text")
+
+
+class T5Gemma2DataParser(MultiModalDataParser):
+    def _parse_text_data(self, data):
+        if data is None or (hasattr(data, "__len__") and not len(data)):
+            return T5Gemma2EncoderItems(None)
+        if isinstance(data, (str, Mapping)):
+            return T5Gemma2EncoderItems(data)
+        if isinstance(data, (list, tuple)) and all(
+            isinstance(item, (str, Mapping)) for item in data
+        ):
+            return T5Gemma2EncoderItems(list(data))
+        raise TypeError(
+            "Text data must be a string, a {'text', 'images'} mapping, or "
+            f"a list of those; got {type(data)}"
+        )
+
+    def _get_subparsers(self):
+        return {"text": self._parse_text_data}
 
 
 class T5Gemma2ProcessingInfo(BaseProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config()
+
+    def get_hf_processor(self, **kwargs):
+        # Resolves to Gemma3Processor (the auto-mapped processor for
+        # model_type "t5gemma2"); only needed for image items.
+        return self.ctx.get_hf_processor(**kwargs)
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"text": 1}
@@ -671,10 +797,7 @@ class T5Gemma2ProcessingInfo(BaseProcessingInfo):
         return {"text": seq_len}
 
     def get_data_parser(self) -> MultiModalDataParser:
-        # Reuse bart.py's text-modality parser (str -> TextProcessorItems).
-        from .bart import TextDataParser
-
-        return TextDataParser()
+        return T5Gemma2DataParser()
 
     def get_placeholder_token_id(self) -> int:
         config = self.get_hf_config()
@@ -694,6 +817,28 @@ class T5Gemma2ProcessingInfo(BaseProcessingInfo):
         # Gemma tokenizers prepend BOS by default; this matches how HF users
         # feed the T5Gemma2 encoder (tokenizer defaults).
         return tokenizer.encode(text, add_special_tokens=True)
+
+    def process_encoder_item(
+        self, item: object
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One encoder item -> (encoder_input_ids (1, N), pixel_values).
+
+        Image items go through the real HF processor (Gemma3Processor),
+        which expands each <start_of_image> marker in the text into the
+        boi + mm_tokens_per_image image-soft-tokens + eoi block and
+        preprocesses the images; pure-text items use the tokenizer alone.
+        Text-only items get an empty pixel tensor so that every item
+        carries a uniform field set.
+        """
+        text, images = _split_encoder_item(item)
+        if images:
+            hf_processor = self.get_hf_processor()
+            processed = hf_processor(
+                text=text, images=images, return_tensors="pt"
+            )
+            return processed["input_ids"], processed["pixel_values"]
+        encoder_input_ids = torch.tensor([self.tokenize_encoder_text(text)])
+        return encoder_input_ids, torch.zeros((0, 3, 1, 1))
 
 
 class T5Gemma2DummyInputsBuilder(
@@ -726,11 +871,11 @@ class T5Gemma2MultiModalProcessor(
         mm_kwargs: Mapping[str, object],
         tok_kwargs: Mapping[str, object],
     ):
-        """T5Gemma2's encoder input is plain text; tokenize it directly.
+        """Process the encoder item and tokenize the decoder prompt.
 
-        Produces ``encoder_input_ids`` (the encoder text from
-        ``mm_data["texts"]``) and ``input_ids`` (the decoder prompt, BOS
-        included via tokenizer defaults).
+        Produces ``encoder_input_ids`` + ``pixel_values`` (from the "text"
+        mm item, which may carry images) and ``input_ids`` (the decoder
+        prompt, BOS included via tokenizer defaults).
         """
         from transformers.feature_extraction_utils import BatchFeature
 
@@ -738,11 +883,23 @@ class T5Gemma2MultiModalProcessor(
         result: dict[str, Any] = {}
 
         if mm_data and "texts" in mm_data:
-            encoder_texts = mm_data["texts"]
-            encoder_text = encoder_texts[0] if encoder_texts else ""
-            result["encoder_input_ids"] = torch.tensor(
-                [self.info.tokenize_encoder_text(encoder_text)]
+            encoder_items = mm_data["texts"]
+            encoder_item = encoder_items[0] if encoder_items else ""
+            encoder_input_ids, pixel_values = (
+                self.info.process_encoder_item(encoder_item)
             )
+            max_model_len = self.info.ctx.model_config.max_model_len
+            if encoder_input_ids.shape[-1] >= max_model_len:
+                raise ValueError(
+                    f"The encoder input needs {encoder_input_ids.shape[-1]} "
+                    f"tokens but max_model_len is {max_model_len} (each "
+                    "image costs ~mm_tokens_per_image+6 tokens and the "
+                    "generated tokens share the same budget)."
+                )
+            result["encoder_input_ids"] = encoder_input_ids
+            # Keep the batch dim so the batched("text") field sees one
+            # entry per item: (1, num_images, 3, H, W).
+            result["pixel_values"] = pixel_values.unsqueeze(0)
 
         if (
             isinstance(prompt, (list, tuple))
@@ -766,7 +923,10 @@ class T5Gemma2MultiModalProcessor(
         hf_inputs,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        return dict(encoder_input_ids=MultiModalFieldConfig.batched("text"))
+        return dict(
+            encoder_input_ids=MultiModalFieldConfig.batched("text"),
+            pixel_values=MultiModalFieldConfig.batched("text"),
+        )
 
     def _get_prompt_updates(
         self,
@@ -778,21 +938,30 @@ class T5Gemma2MultiModalProcessor(
 
         The placeholders reserve paged-KV slots for the encoder prefix and
         are replaced by encoder-output embeddings at runtime.  The count
-        must match ``embed_multimodal``'s output length exactly, so the text
-        is tokenized identically to ``_call_hf_processor``.
+        must match ``embed_multimodal``'s output length exactly, so it is
+        read from the already-processed ``encoder_input_ids`` when
+        available, else recomputed with the identical processing call.
         """
-        from .bart import TextProcessorItems
-
         if mm_items.get_count("text", strict=False) == 0:
             return []
 
-        text_items = mm_items.get_items("text", TextProcessorItems)
+        text_items = mm_items.get_items("text", T5Gemma2EncoderItems)
         placeholder = self.info.get_placeholder_token_id()
 
         def get_insertion(item_idx: int) -> list[int]:
-            num_tokens = len(
-                self.info.tokenize_encoder_text(text_items.get(item_idx))
-            )
+            num_tokens = None
+            try:
+                item_kwargs = out_mm_kwargs["text"][item_idx]
+                num_tokens = int(
+                    item_kwargs["encoder_input_ids"].data.shape[-1]
+                )
+            except (KeyError, IndexError, TypeError, AttributeError):
+                pass
+            if num_tokens is None:
+                encoder_input_ids, _ = self.info.process_encoder_item(
+                    text_items.get(item_idx)
+                )
+                num_tokens = encoder_input_ids.shape[-1]
             return [placeholder] * num_tokens
 
         return [
@@ -804,12 +973,11 @@ class T5Gemma2MultiModalProcessor(
         ]
 
 
-_SKIP_WEIGHT_PREFIXES = (
-    # Text-to-text only for now: the SigLIP tower and projector are not
-    # instantiated, so their weights are dropped at load time.
-    "model.encoder.vision_tower.",
-    "model.encoder.multi_modal_projector.",
-)
+# Vision-tower weights are not handled by the name mapping: load_weights
+# routes them (prefix-stripped) into SiglipVisionModel.load_weights, which
+# does its own q/k/v fusion.
+_VISION_TOWER_PREFIX = "model.encoder.vision_tower."
+_SKIP_WEIGHT_PREFIXES = (_VISION_TOWER_PREFIX,)
 
 _STACKED_WEIGHT_MAPPING = [
     # (vllm_fused_param, hf_shard_name, shard_id)
@@ -847,7 +1015,7 @@ def map_t5gemma2_weight_name(
     if name.startswith("lm_head.out_proj."):
         name = name.replace("lm_head.out_proj.", "lm_head.")
     if name.startswith(_ENCODER_PREFIX) and not name.startswith(
-        _ENCODER_TEXT_PREFIX
+        (_ENCODER_TEXT_PREFIX, "model.encoder.multi_modal_projector.")
     ):
         name = _ENCODER_TEXT_PREFIX + name[len(_ENCODER_PREFIX):]
     for param_name, shard_name, shard_id in _STACKED_WEIGHT_MAPPING:
@@ -983,23 +1151,92 @@ class T5Gemma2ForConditionalGeneration(
             f"{type(encoder_input_ids)}"
         )
 
+    def _parse_pixel_values(
+        self, pixel_values: object, num_items: int
+    ) -> list[torch.Tensor | None]:
+        """Per-item image tensors aligned with the encoder_input_ids items.
+
+        Text-only items carry an empty (0, 3, 1, 1) tensor (emitted by the
+        processor so every item has a uniform field set); those become None.
+        """
+        if pixel_values is None:
+            return [None] * num_items
+        if isinstance(pixel_values, torch.Tensor):
+            items = list(pixel_values.unbind(0))
+        elif isinstance(pixel_values, (list, tuple)):
+            items = list(pixel_values)
+        else:
+            raise ValueError(
+                f"Incorrect type of pixel_values: {type(pixel_values)}"
+            )
+        parsed: list[torch.Tensor | None] = []
+        for item in items:
+            # Squeeze a leading batch dim of 1: (1, n, 3, H, W) -> (n, ...)
+            if isinstance(item, torch.Tensor) and item.dim() == 5:
+                item = item.squeeze(0)
+            if isinstance(item, torch.Tensor) and item.numel() == 0:
+                item = None
+            parsed.append(item)
+        if len(parsed) != num_items:
+            raise ValueError(
+                f"Got {len(parsed)} pixel_values items for "
+                f"{num_items} encoder text items."
+            )
+        return parsed
+
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         encoder_input_ids_list = self._parse_and_validate_encoder_input(
             **kwargs
         )
         if not encoder_input_ids_list:
             return []
+        pixel_values_list = self._parse_pixel_values(
+            kwargs.get("pixel_values"), len(encoder_input_ids_list)
+        )
 
         encoder_outputs: list[torch.Tensor] = []
-        for encoder_input_ids in encoder_input_ids_list:
+        for encoder_input_ids, pixel_values in zip(
+            encoder_input_ids_list, pixel_values_list
+        ):
             encoder_input_ids = encoder_input_ids.flatten()
             positions = torch.arange(
                 encoder_input_ids.numel(),
                 dtype=torch.long,
                 device=encoder_input_ids.device,
             )
+
+            inputs_embeds = None
+            if pixel_values is not None:
+                # HF flow: embed the text (incl. eoi handling), then
+                # overwrite the image-soft-token rows with the projected
+                # SigLIP features, then run the text encoder on embeds.
+                image_features = self.model.encoder.get_image_features(
+                    pixel_values.to(device=encoder_input_ids.device)
+                )
+                inputs_embeds = self.model.encoder.text_model.embed_tokens(
+                    encoder_input_ids
+                ).clone()
+                image_mask = encoder_input_ids == self.placeholder_token_id
+                num_image_rows = int(image_mask.sum())
+                if num_image_rows != image_features.shape[0] * (
+                    image_features.shape[1]
+                ):
+                    raise ValueError(
+                        f"Encoder text has {num_image_rows} image-soft-token "
+                        f"rows (id {self.placeholder_token_id}) but the "
+                        "vision tower produced "
+                        f"{image_features.shape[0] * image_features.shape[1]}"
+                        " feature rows.  Each image needs exactly one "
+                        "<start_of_image> marker in the encoder text."
+                    )
+                inputs_embeds[image_mask] = image_features.flatten(0, 1).to(
+                    inputs_embeds.dtype
+                )
+
             encoder_outputs.append(
-                self.model.encoder.text_model(encoder_input_ids, positions)
+                self.model.encoder.text_model(
+                    encoder_input_ids, positions, inputs_embeds=inputs_embeds
+                )
             )
         return encoder_outputs
 
@@ -1097,8 +1334,18 @@ class T5Gemma2ForConditionalGeneration(
         # Raw checkpoint tensors kept for embedding tying.
         encoder_embed_weight: torch.Tensor | None = None
         encoder_eoi_embedding: torch.Tensor | None = None
+        vision_weights: list[tuple[str, torch.Tensor]] = []
 
         for name, loaded_weight in weights:
+            if name.startswith(_VISION_TOWER_PREFIX):
+                vision_name = name[len(_VISION_TOWER_PREFIX):]
+                # vLLM's SiglipVisionModel expects vision_model.*; some
+                # transformers versions nest the SigLIP body directly
+                # under vision_tower (no vision_model segment).
+                if not vision_name.startswith("vision_model."):
+                    vision_name = "vision_model." + vision_name
+                vision_weights.append((vision_name, loaded_weight))
+                continue
             mapped = map_t5gemma2_weight_name(name)
             if mapped is None:
                 continue
@@ -1121,6 +1368,15 @@ class T5Gemma2ForConditionalGeneration(
                 )
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        # SiglipVisionModel does its own stacked-shard fusion.
+        if vision_weights:
+            loaded_vision = self.model.encoder.vision_tower.load_weights(
+                vision_weights
+            )
+            loaded_params.update(
+                _VISION_TOWER_PREFIX + name for name in loaded_vision
+            )
 
         # decoder.embed_tokens and lm_head are tied to the encoder embedding
         # and may be absent from the checkpoint.

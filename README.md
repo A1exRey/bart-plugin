@@ -118,6 +118,20 @@ outputs = llm.generate(
     [{"prompt": "", "multi_modal_data": {"text": "Text to transform..."}}],
     SamplingParams(temperature=0.0, max_tokens=64),
 )
+
+# Images: the encoder item carries text and images together; each image
+# needs one <start_of_image> marker in the text and costs
+# ~mm_tokens_per_image+6 (~262) encoder tokens, so exactly ONE image fits
+# the 270m checkpoint's 512-token window.
+outputs = llm.generate(
+    [{
+        "prompt": "",
+        "multi_modal_data": {
+            "text": {"text": "<start_of_image>", "images": [pil_image]},
+        },
+    }],
+    SamplingParams(temperature=0.0, max_tokens=64),
+)
 ```
 
 T5Gemma 2's decoder fuses self- and cross-attention into a single softmax
@@ -127,10 +141,11 @@ rows of the paged KV cache — mathematically exact below the sliding-window
 bound (see `vllm_bart_plugin/t5gemma2.py` and `tests/test_t5gemma2_math.py`
 for the derivation and its proof against the HF reference).  The encoder
 applies HF's exact bidirectional sliding-window masks and is exact at any
-length.  Current limitations: text-only (the SigLIP vision tower is
-skipped), total context capped at the decoder sliding window
-(`config.decoder.sliding_window`, 512 for the 270m checkpoint), no prefix
-caching.  See `example_t5gemma2_usage.py` and `scripts/parity_t5gemma2.py`.
+length.  Image input (SigLIP tower) is supported as shown above.  Current
+limitations: total context capped at the decoder sliding window
+(`config.decoder.sliding_window`, 512 for the 270m checkpoint — hence at
+most one image per request), no prefix caching.  See
+`example_t5gemma2_usage.py` and `scripts/parity_t5gemma2.py` (`--image`).
 
 Numerical parity vs HuggingFace: exact in float32
 (`scripts/parity_t5gemma2.py --dtype float32`).  In bfloat16, vLLM's
@@ -206,8 +221,8 @@ See `scripts/eval_cnn_dailymail.py` for more options and reference ROUGE scores.
  - [ ] Support `MBartForConditionalGeneration`
  - [x] Support `Florence2ForConditionalGeneration`
  - [x] Support `T5Gemma2ForConditionalGeneration` (text-to-text)
- - [ ] T5Gemma2: image inputs (SigLIP vision tower)
- - [ ] T5Gemma2: contexts beyond the sliding window, prefix caching
+ - [x] T5Gemma2: image inputs (SigLIP vision tower; one image per request under the 512-token window)
+ - [ ] T5Gemma2: contexts beyond the sliding window (enables multi-image), prefix caching
 
 ## Environment Variables
 
