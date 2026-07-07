@@ -52,14 +52,31 @@ class FakeHFProcessor:
         }
 
 
-def _make_info(max_model_len=512):
+def _make_hf_config(long_mode=False, window=512):
+    """Minimal hf_config fake: long mode is detected via the stash attr on
+    config.decoder (set by t5gemma2_long_context_hf_overrides)."""
+    from types import SimpleNamespace
+
+    decoder = SimpleNamespace(sliding_window=window)
+    if long_mode:
+        from vllm_bart_plugin.t5gemma2_long import SLIDING_WINDOW_STASH_ATTR
+
+        setattr(decoder, SLIDING_WINDOW_STASH_ATTR, window)
+        decoder.sliding_window = None
+    return SimpleNamespace(decoder=decoder)
+
+
+def _make_info(max_model_len=512, long_mode=False):
     from types import SimpleNamespace
 
     from vllm_bart_plugin.t5gemma2 import T5Gemma2ProcessingInfo
 
     info = T5Gemma2ProcessingInfo.__new__(T5Gemma2ProcessingInfo)
     info.ctx = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=max_model_len)
+        model_config=SimpleNamespace(
+            max_model_len=max_model_len,
+            hf_config=_make_hf_config(long_mode),
+        )
     )
     # Shadow the ctx-dependent lookups with fakes; the methods under test
     # (process_encoder_item, tokenize_encoder_text, ...) stay real.
@@ -69,13 +86,13 @@ def _make_info(max_model_len=512):
     return info
 
 
-def _make_processor(max_model_len=512):
+def _make_processor(max_model_len=512, long_mode=False):
     from vllm_bart_plugin.t5gemma2 import T5Gemma2MultiModalProcessor
 
     processor = T5Gemma2MultiModalProcessor.__new__(
         T5Gemma2MultiModalProcessor
     )
-    processor.info = _make_info(max_model_len)
+    processor.info = _make_info(max_model_len, long_mode)
     return processor
 
 
@@ -214,6 +231,37 @@ def test_prompt_updates_prefer_processed_length_from_out_mm_kwargs():
     assert update.content(0) == [262144] * 7
 
 
+def test_prompt_updates_long_mode_pad_to_block_boundary():
+    from vllm.multimodal.processing import PromptUpdateDetails
+
+    from vllm_bart_plugin.t5gemma2_prefix import PREFIX_PAD
+
+    processor = _make_processor(long_mode=True)
+    (update,) = processor._get_prompt_updates(FakeItems(), {}, {})
+    details = update.content(0)
+    assert isinstance(details, PromptUpdateDetails)
+    # BOS + 4 words = 5 encoder tokens, padded to 16 placeholders.
+    assert details.full == [262144] * PREFIX_PAD
+    mask = details.is_embed(None, details.full)
+    assert mask.tolist() == [True] * 5 + [False] * (PREFIX_PAD - 5)
+
+
+def test_call_hf_processor_long_mode_budget_includes_padding():
+    # 5 encoder tokens pad to 16; with max_model_len=16 the decoder BOS no
+    # longer fits, so the request must be rejected.
+    processor = _make_processor(max_model_len=16, long_mode=True)
+    with pytest.raises(ValueError, match="max_model_len"):
+        processor._call_hf_processor(
+            "", {"texts": ["one two three four"]}, {}, {}
+        )
+    # The same input fits in short mode (5 < 16).
+    processor = _make_processor(max_model_len=16)
+    out = processor._call_hf_processor(
+        "", {"texts": ["one two three four"]}, {}, {}
+    )
+    assert out["encoder_input_ids"].shape == (1, 5)
+
+
 def test_prompt_updates_empty_without_text_items():
     processor = _make_processor()
 
@@ -232,6 +280,7 @@ def _make_model_shell():
     )
     model.placeholder_token_id = 262144
     model._pending_prefix_mask = None
+    model._prefix_pad = 1
     return model
 
 
@@ -277,6 +326,32 @@ def test_resolve_prefix_ctx_pads_mask_for_padded_batches():
     ctx = model._resolve_prefix_ctx(None, positions, inputs_embeds)
     assert ctx.is_prefix.tolist() == [True, True, False, False, False]
     assert ctx.rope_positions.tolist() == [2, 2, 2, 0, 0]
+
+
+def test_resolve_prefix_ctx_long_mode_pins_to_padded_length():
+    from vllm_bart_plugin.t5gemma2_prefix import PREFIX_PAD
+
+    model = _make_model_shell()
+    model._prefix_pad = PREFIX_PAD
+    n_real, n_pad, t = 5, PREFIX_PAD, 3
+    total = n_pad + t
+    positions = torch.arange(total)
+    inputs_embeds = torch.randn(total, 8)
+    # Runner is_multimodal mask covers only the embedded (real) rows.
+    mask = torch.zeros(total, dtype=torch.bool)
+    mask[:n_real] = True
+
+    model._pending_prefix_mask = mask
+    ctx = model._resolve_prefix_ctx(None, positions, inputs_embeds)
+    # Real prefix rows pin to N_pad; padding rows keep their absolute
+    # positions (their KV is excluded from both attention passes); decoder
+    # rows start at N_pad.
+    assert ctx.rope_positions.tolist() == (
+        [n_pad] * n_real
+        + list(range(n_real, n_pad))
+        + list(range(n_pad, total))
+    )
+    assert torch.equal(ctx.enc_rows, inputs_embeds[:n_real])
 
 
 def test_resolve_prefix_ctx_decode_only_returns_none():

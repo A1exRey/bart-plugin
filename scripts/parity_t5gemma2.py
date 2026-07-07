@@ -5,10 +5,14 @@
 Run on a machine with a GPU and access to the (gated) checkpoint:
 
     huggingface-cli login
-    # decisive exactness gate (implementation correctness):
+    # decisive exactness gate (implementation correctness, short mode):
     python scripts/parity_t5gemma2.py --dtype float32
     # production-dtype view (kernel-level numeric drift is expected):
     python scripts/parity_t5gemma2.py
+    # long-context mode (beyond the sliding window; bf16 is the GPU gate,
+    # the fp32 exactness proof is the CPU math suite):
+    python scripts/parity_t5gemma2.py --long-context
+    python scripts/parity_t5gemma2.py --long-context --image --num-images 2
 
 Checks, in order of increasing integration depth:
 
@@ -25,12 +29,33 @@ Checks, in order of increasing integration depth:
               batching, which produces HUGE diffs; small drift from
               batch-size-dependent kernel reductions is tolerated).
 
-Why two dtypes: float32 makes vLLM and HF numerically comparable, so any
-diff above ~1e-2 is a real bug.  bfloat16 diffs up to a few tenths of a
-logprob are cross-implementation kernel noise, not plugin bugs — the
-float32 run is what distinguishes the two.
+Dtype matrix:
 
-If (1) fails in float32, nothing else can work - fix that first.
+- float32: the decisive exactness gate — but SHORT MODE ONLY.
+  FlashAttention kernels are fp16/bf16-only, and long mode's two-pass
+  attention needs FlashAttention's LSE return, so float32 + --long-context
+  is rejected up front.  The fp32 exactness proof for the long formulation
+  lives in tests/test_t5gemma2_math.py (vs HF, ~1e-4 on CPU); the GPU fp32
+  short-mode run still validates all shared plumbing.
+- bfloat16: the ONLY usable GPU dtype for long mode, and the production
+  dtype.  A few tenths of a logprob of noise is expected.
+- float16 is deliberately NOT offered: Gemma-family activations overflow
+  fp16's range (max 65504; bf16 has fp32's range) in BOTH stacks, giving
+  universal NaN logprobs — and "greedy exact" false positives, because HF
+  and vLLM degenerate identically on argmax-of-NaN.  Measured on
+  t5gemma-2-270m: every prompt logprob NaN including vLLM-only checks.
+
+If prefill fails in the tightest dtype available for the mode, nothing
+else can work - fix that first.
+
+Long-context mode (--long-context) runs the same checks with
+t5gemma2_long_context_hf_overrides, a max_model_len ABOVE the decoder
+sliding window (default 4x), block_size=16, and sources long enough that
+prefill and decode cross the window (exercising the two-pass LSE-merge
+attention).  Needs transformers >= 5.7 (HF's own beyond-window
+cross-attention cache fix) and the FLASH_ATTN backend.  --num-images N
+captions N distinct images in one request; N >= 2 exceeds the 512-token
+window on the 270m and therefore requires --long-context.
 """
 
 import argparse
@@ -84,30 +109,68 @@ def load_hf(model_name: str, device: str, dtype: str):
     return tokenizer, model
 
 
-def derive_max_model_len(model_name: str) -> int:
-    """The plugin is exact up to the decoder's sliding window."""
+def derive_max_model_len(model_name: str, long_context: bool) -> int:
+    """Short mode: exact up to the decoder's sliding window.  Long mode:
+    default to 4x the window (the two-pass attention is exact at any
+    length; this just keeps the default KV footprint sane)."""
     from transformers import AutoConfig
 
     config = AutoConfig.from_pretrained(model_name)
     window = getattr(config.decoder, "sliding_window", None)
+    if long_context:
+        max_positions = getattr(
+            config.decoder, "max_position_embeddings", 4096
+        )
+        return min(4 * (window or 4096), max_positions)
     return min(window or 4096, 4096)
 
 
+def make_long_sources(tokenizer, window: int, num: int) -> list[str]:
+    """Sources whose encoder tokenization exceeds the sliding window, each
+    starting from a different sentence so the cases are not identical."""
+    sources = []
+    for case in range(num):
+        parts = []
+        i = case
+        while len(tokenizer(" ".join(parts)).input_ids) <= int(window * 1.5):
+            parts.append(SOURCES[i % len(SOURCES)])
+            i += 1
+        sources.append(" ".join(parts))
+    return sources
+
+
 def load_vllm(
-    model_name: str, enforce_eager: bool, max_model_len: int, dtype: str
+    model_name: str,
+    enforce_eager: bool,
+    max_model_len: int,
+    dtype: str,
+    long_context: bool,
 ):
     from vllm import LLM
 
-    from vllm_bart_plugin.t5gemma2 import t5gemma2_hf_overrides
+    from vllm_bart_plugin.t5gemma2 import (
+        t5gemma2_hf_overrides,
+        t5gemma2_long_context_hf_overrides,
+    )
 
+    kwargs = {}
+    if long_context:
+        # The two-pass attention slices the block table at the prefix pad
+        # boundary, which must equal the KV block size.
+        kwargs["block_size"] = 16
     return LLM(
         model=model_name,
-        hf_overrides=t5gemma2_hf_overrides,
+        hf_overrides=(
+            t5gemma2_long_context_hf_overrides
+            if long_context
+            else t5gemma2_hf_overrides
+        ),
         max_model_len=max_model_len,
         enable_prefix_caching=False,
         disable_chunked_mm_input=True,
         dtype=dtype,
         enforce_eager=enforce_eager,
+        **kwargs,
     )
 
 
@@ -146,7 +209,7 @@ def check_prefill(tokenizer, hf_model, llm, args) -> bool:
     diffs: list[float] = []
     ok = True
     params = SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=0)
-    for source in SOURCES[: args.num_cases]:
+    for source in args.sources[: args.num_cases]:
         for prefix in DECODER_PREFIXES:
             if not prefix:
                 continue  # need >=1 non-BOS decoder token to compare
@@ -199,7 +262,7 @@ def check_greedy(tokenizer, hf_model, llm, args) -> bool:
           f"({'gating' if gating else 'informational in ' + args.dtype}) ===")
     params = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
     ok = True
-    for source in SOURCES[: args.num_cases]:
+    for source in args.sources[: args.num_cases]:
         enc_ids = tokenizer(source, return_tensors="pt").input_ids.to(
             hf_model.device
         )
@@ -262,7 +325,7 @@ def check_batching(llm, args) -> bool:
             "prompt": "The answer is",
             "multi_modal_data": {"text": source},
         }
-        for source in SOURCES
+        for source in args.sources
     ]
     solo = [
         _last_token_logprobs(llm, [prompt], params)[0] for prompt in prompts
@@ -284,10 +347,12 @@ def check_batching(llm, args) -> bool:
     return ok
 
 
-def _synthetic_image():
+def _synthetic_image(variant: int = 0):
     """A structured image (gradient + solid square), NOT noise: a noise
     image gives a nearly flat caption distribution where every greedy step
-    is a near-tie, making token comparisons meaninglessly fragile."""
+    is a near-tie, making token comparisons meaninglessly fragile.
+    ``variant`` moves and recolors the square so multi-image requests see
+    distinct images."""
     import numpy as np
     from PIL import Image
 
@@ -296,12 +361,15 @@ def _synthetic_image():
     array = np.stack(
         [gradient, gradient[::-1], np.full_like(gradient, 128.0)], axis=-1
     ).astype(np.uint8)
-    array[60:160, 60:160] = (200, 40, 40)
+    colors = [(200, 40, 40), (40, 200, 40), (40, 40, 200), (200, 200, 40)]
+    offset = 60 + 20 * (variant % 3)
+    array[offset:offset + 100, offset:offset + 100] = colors[variant % 4]
     return Image.fromarray(array)
 
 
 def check_image(tokenizer, hf_model, llm, args) -> bool:
-    """Single image (fits the 512-token window: ~262 encoder tokens).
+    """Image parity (one image fits the 512-token window: ~262 encoder
+    tokens; --num-images >= 2 needs --long-context).
 
     Gates on teacher-forced logprobs of a fixed decoder prefix (one
     forward, same tolerances as the prefill check); greedy tokens are
@@ -311,13 +379,14 @@ def check_image(tokenizer, hf_model, llm, args) -> bool:
     from transformers import AutoProcessor
     from vllm import SamplingParams
 
-    print("\n=== 4. image parity (teacher-forced logprobs gate) ===")
-    image = _synthetic_image()
-    text = "<start_of_image>"
+    print(f"\n=== 4. image parity ({args.num_images} image(s), "
+          "teacher-forced logprobs gate) ===")
+    images = [_synthetic_image(i) for i in range(args.num_images)]
+    text = " ".join(["<start_of_image>"] * args.num_images)
     decoder_prefix = "The image shows"
 
     hf_processor = AutoProcessor.from_pretrained(args.model)
-    hf_inputs = hf_processor(text=text, images=[image], return_tensors="pt")
+    hf_inputs = hf_processor(text=text, images=images, return_tensors="pt")
     enc_ids = hf_inputs["input_ids"].to(hf_model.device)
     pixel_values = hf_inputs["pixel_values"].to(
         hf_model.device, hf_model.dtype
@@ -339,7 +408,7 @@ def check_image(tokenizer, hf_model, llm, args) -> bool:
         for t in range(1, dec_ids.shape[1])
     ]
 
-    mm_data = {"text": {"text": text, "images": [image]}}
+    mm_data = {"text": {"text": text, "images": images}}
     out = llm.generate(
         [{"prompt": decoder_prefix, "multi_modal_data": mm_data}],
         SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=0),
@@ -398,14 +467,17 @@ def main():
     parser.add_argument("--num-cases", type=int, default=4)
     parser.add_argument("--dtype", default="bfloat16",
                         choices=["bfloat16", "float32"],
-                        help="float32 = decisive exactness gate; bfloat16 = "
-                             "production dtype (kernel noise expected)")
+                        help="float32 = decisive exactness gate (short mode "
+                             "only: FlashAttention is fp16/bf16-only); "
+                             "bfloat16 = production dtype and the long-mode "
+                             "gate (fp16 is not offered: Gemma activations "
+                             "overflow its range -> NaN in both stacks)")
     parser.add_argument("--prefill-tol", type=float, default=None,
-                        help="worst-case |logprob diff| gate; default: "
-                             "0.02 for float32, 1.0 for bfloat16")
+                        help="worst-case |logprob diff| gate; defaults per "
+                             "dtype/mode, see main()")
     parser.add_argument("--prefill-mean-tol", type=float, default=None,
-                        help="mean |logprob diff| gate; default: "
-                             "0.005 for float32, 0.15 for bfloat16")
+                        help="mean |logprob diff| gate; defaults per "
+                             "dtype/mode, see main()")
     parser.add_argument("--max-model-len", type=int, default=None,
                         help="defaults to the decoder sliding window")
     parser.add_argument("--no-eager", action="store_true",
@@ -413,21 +485,50 @@ def main():
     parser.add_argument("--skip", nargs="*", default=[],
                         choices=["prefill", "greedy", "batching", "image"])
     parser.add_argument("--image", action="store_true",
-                        help="also check single-image decode parity")
+                        help="also check image decode parity")
+    parser.add_argument("--num-images", type=int, default=1,
+                        help="images per request in the image check; "
+                             ">=2 needs --long-context on the 270m")
+    parser.add_argument("--long-context", action="store_true",
+                        help="beyond-sliding-window mode: long-context "
+                             "hf_overrides, max_model_len above the window "
+                             "(default 4x), block_size=16, long sources")
     args = parser.parse_args()
+
+    if args.num_images > 1 and not args.long_context:
+        parser.error("--num-images >= 2 exceeds the sliding window; "
+                     "add --long-context")
+    if args.long_context and args.dtype == "float32":
+        parser.error(
+            "--long-context requires FlashAttention (LSE return), whose "
+            "kernels are fp16/bf16-only -- float32 cannot run long mode "
+            "on GPU.  The long-mode GPU gate is bfloat16 (fp16 overflows "
+            "Gemma activations -> NaN); the fp32 exactness proof for the "
+            "two-pass math is the CPU test suite.  Run float32 without "
+            "--long-context to gate the shared plumbing."
+        )
 
     is_fp32 = args.dtype == "float32"
     # Measured cross-stack kernel floor for this model (vLLM Triton/C++
     # ops vs HF eager; deterministic, TF32-independent): fp32 mean ~0.009 /
-    # worst ~0.022; bf16 mean ~0.17 / worst ~0.63.  A structural bug sits
-    # orders of magnitude above these.
+    # worst ~0.022; bf16 short mean ~0.17 / worst ~0.63, bf16 long mean
+    # ~0.24 / worst ~1.0 (longer softmaxes + the two-pass merge round-trip
+    # accumulate more noise).  A structural bug sits orders of magnitude
+    # above all of these.
     if args.prefill_tol is None:
-        args.prefill_tol = 0.05 if is_fp32 else 1.0
+        args.prefill_tol = (
+            0.05 if is_fp32 else (1.5 if args.long_context else 1.0)
+        )
     if args.prefill_mean_tol is None:
-        args.prefill_mean_tol = 0.02 if is_fp32 else 0.25
+        args.prefill_mean_tol = (
+            0.02 if is_fp32 else (0.35 if args.long_context else 0.25)
+        )
 
-    max_model_len = args.max_model_len or derive_max_model_len(args.model)
+    max_model_len = args.max_model_len or derive_max_model_len(
+        args.model, args.long_context
+    )
     print(f"dtype = {args.dtype} (TF32 disabled), "
+          f"long_context = {args.long_context}, "
           f"max_model_len = {max_model_len}, prefill tol worst/mean = "
           f"{args.prefill_tol}/{args.prefill_mean_tol}")
     tokenizer, hf_model = load_hf(args.model, args.device, args.dtype)
@@ -436,7 +537,24 @@ def main():
         enforce_eager=not args.no_eager,
         max_model_len=max_model_len,
         dtype=args.dtype,
+        long_context=args.long_context,
     )
+
+    args.sources = list(SOURCES)
+    if args.long_context:
+        # Mix beyond-window sources (which exercise the two-pass attention
+        # on both halves) with a couple of short ones (which must remain
+        # exact in long mode too).
+        window = derive_max_model_len(args.model, long_context=False)
+        long_sources = make_long_sources(
+            tokenizer, window, max(1, args.num_cases - 2)
+        )
+        lengths = [
+            len(tokenizer(source).input_ids) for source in long_sources
+        ]
+        print(f"long sources: {len(long_sources)} x {lengths} encoder "
+              f"tokens (window {window})")
+        args.sources = long_sources + list(SOURCES)
 
     results = {}
     if "prefill" not in args.skip:
