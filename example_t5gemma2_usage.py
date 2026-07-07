@@ -31,7 +31,6 @@ def main():
         enable_prefix_caching=False,
         disable_chunked_mm_input=True,
         dtype="bfloat16",
-        enforce_eager=True,  # relax once CUDA-graph runs are validated
     )
 
     source_texts = [
