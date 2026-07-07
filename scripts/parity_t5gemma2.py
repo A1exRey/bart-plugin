@@ -5,10 +5,14 @@
 Run on a machine with a GPU and access to the (gated) checkpoint:
 
     huggingface-cli login
-    # decisive exactness gate (implementation correctness):
+    # decisive exactness gate (implementation correctness, short mode):
     python scripts/parity_t5gemma2.py --dtype float32
     # production-dtype view (kernel-level numeric drift is expected):
     python scripts/parity_t5gemma2.py
+    # long-context mode (beyond the sliding window; fp16 = tightest gate):
+    python scripts/parity_t5gemma2.py --long-context --dtype float16
+    python scripts/parity_t5gemma2.py --long-context
+    python scripts/parity_t5gemma2.py --long-context --image --num-images 2
 
 Checks, in order of increasing integration depth:
 
@@ -25,12 +29,21 @@ Checks, in order of increasing integration depth:
               batching, which produces HUGE diffs; small drift from
               batch-size-dependent kernel reductions is tolerated).
 
-Why two dtypes: float32 makes vLLM and HF numerically comparable, so any
-diff above ~1e-2 is a real bug.  bfloat16 diffs up to a few tenths of a
-logprob are cross-implementation kernel noise, not plugin bugs — the
-float32 run is what distinguishes the two.
+Dtype matrix:
 
-If (1) fails in float32, nothing else can work - fix that first.
+- float32: the decisive exactness gate — but SHORT MODE ONLY.
+  FlashAttention kernels are fp16/bf16-only, and long mode's two-pass
+  attention needs FlashAttention's LSE return, so float32 + --long-context
+  is rejected up front.  The fp32 exactness proof for the long formulation
+  lives in tests/test_t5gemma2_math.py (vs HF, ~1e-4 on CPU); the GPU fp32
+  short-mode run still validates all shared plumbing.
+- float16: the tightest FA-compatible gate — use this for long mode.
+  3 more mantissa bits than bf16, so kernel noise is ~8x smaller.
+- bfloat16: production dtype; a few tenths of a logprob of noise is
+  expected.
+
+If prefill fails in the tightest dtype available for the mode, nothing
+else can work - fix that first.
 
 Long-context mode (--long-context) runs the same checks with
 t5gemma2_long_context_hf_overrides, a max_model_len ABOVE the decoder
@@ -450,15 +463,18 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--num-cases", type=int, default=4)
     parser.add_argument("--dtype", default="bfloat16",
-                        choices=["bfloat16", "float32"],
-                        help="float32 = decisive exactness gate; bfloat16 = "
-                             "production dtype (kernel noise expected)")
+                        choices=["bfloat16", "float16", "float32"],
+                        help="float32 = decisive exactness gate (short mode "
+                             "only: FlashAttention is fp16/bf16-only); "
+                             "float16 = tightest FA-compatible gate (use "
+                             "for long mode); bfloat16 = production dtype "
+                             "(kernel noise expected)")
     parser.add_argument("--prefill-tol", type=float, default=None,
-                        help="worst-case |logprob diff| gate; default: "
-                             "0.02 for float32, 1.0 for bfloat16")
+                        help="worst-case |logprob diff| gate; defaults per "
+                             "dtype/mode, see main()")
     parser.add_argument("--prefill-mean-tol", type=float, default=None,
-                        help="mean |logprob diff| gate; default: "
-                             "0.005 for float32, 0.15 for bfloat16")
+                        help="mean |logprob diff| gate; defaults per "
+                             "dtype/mode, see main()")
     parser.add_argument("--max-model-len", type=int, default=None,
                         help="defaults to the decoder sliding window")
     parser.add_argument("--no-eager", action="store_true",
@@ -479,16 +495,36 @@ def main():
     if args.num_images > 1 and not args.long_context:
         parser.error("--num-images >= 2 exceeds the sliding window; "
                      "add --long-context")
+    if args.long_context and args.dtype == "float32":
+        parser.error(
+            "--long-context requires FlashAttention (LSE return), whose "
+            "kernels are fp16/bf16-only -- float32 cannot run long mode "
+            "on GPU.  Use --dtype float16 for the tightest long-mode gate "
+            "(the fp32 exactness proof for the two-pass math is the CPU "
+            "test suite), or run float32 without --long-context to gate "
+            "the shared plumbing."
+        )
 
     is_fp32 = args.dtype == "float32"
     # Measured cross-stack kernel floor for this model (vLLM Triton/C++
     # ops vs HF eager; deterministic, TF32-independent): fp32 mean ~0.009 /
-    # worst ~0.022; bf16 mean ~0.17 / worst ~0.63.  A structural bug sits
-    # orders of magnitude above these.
+    # worst ~0.022; bf16 short mean ~0.17 / worst ~0.63, bf16 long mean
+    # ~0.24 / worst ~1.0 (longer softmaxes + the two-pass merge round-trip
+    # accumulate more noise).  fp16 defaults are provisional (~8x below
+    # bf16 by mantissa width); calibrate them from the first run's printed
+    # floor.  A structural bug sits orders of magnitude above all of these.
     if args.prefill_tol is None:
-        args.prefill_tol = 0.05 if is_fp32 else 1.0
+        args.prefill_tol = {
+            "float32": 0.05,
+            "float16": 0.25,
+            "bfloat16": 1.5 if args.long_context else 1.0,
+        }[args.dtype]
     if args.prefill_mean_tol is None:
-        args.prefill_mean_tol = 0.02 if is_fp32 else 0.25
+        args.prefill_mean_tol = {
+            "float32": 0.02,
+            "float16": 0.06,
+            "bfloat16": 0.35 if args.long_context else 0.25,
+        }[args.dtype]
 
     max_model_len = args.max_model_len or derive_max_model_len(
         args.model, args.long_context

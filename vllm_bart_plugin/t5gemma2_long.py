@@ -434,8 +434,11 @@ if HAS_LONG_CONTEXT_VLLM:
                     "T5Gemma2 long-context mode requires the FLASH_ATTN "
                     "backend (the two-pass attention needs FlashAttention's "
                     "LSE return); resolved backend: "
-                    f"{underlying.get_name()}.  Within the sliding window, "
-                    "other backends work without long mode."
+                    f"{underlying.get_name()}.  Note FlashAttention kernels "
+                    "are fp16/bf16-only, so dtype=float32 always resolves "
+                    "elsewhere -- run long mode in bfloat16 or float16.  "
+                    "Within the sliding window, other backends (and fp32) "
+                    "work without long mode."
                 )
             super().__init__(
                 cache_config=cache_config,
