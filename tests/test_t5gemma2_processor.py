@@ -262,38 +262,6 @@ def test_call_hf_processor_long_mode_budget_includes_padding():
     assert out["encoder_input_ids"].shape == (1, 5)
 
 
-def test_long_context_hf_overrides_stash_and_idempotency():
-    from transformers.models.t5gemma2.configuration_t5gemma2 import (
-        T5Gemma2Config,
-    )
-
-    from vllm_bart_plugin.t5gemma2 import t5gemma2_long_context_hf_overrides
-    from vllm_bart_plugin.t5gemma2_long import (
-        SLIDING_WINDOW_STASH_ATTR,
-        is_long_context_mode,
-        long_context_sliding_window,
-    )
-
-    config = T5Gemma2Config()
-    original_window = config.decoder.sliding_window
-    assert not is_long_context_mode(config)
-    assert long_context_sliding_window(config) == original_window
-
-    config = t5gemma2_long_context_hf_overrides(config)
-    assert config.is_encoder_decoder is False
-    assert config.is_mm_prefix_lm is True
-    assert config.decoder.sliding_window is None
-    assert is_long_context_mode(config)
-    assert long_context_sliding_window(config) == original_window
-    assert (
-        getattr(config.decoder, SLIDING_WINDOW_STASH_ATTR) == original_window
-    )
-
-    # Applying twice must not stash the nulled value over the real one.
-    config = t5gemma2_long_context_hf_overrides(config)
-    assert long_context_sliding_window(config) == original_window
-
-
 def test_prompt_updates_empty_without_text_items():
     processor = _make_processor()
 

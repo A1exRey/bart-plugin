@@ -107,7 +107,14 @@ def t5gemma2_long_context_hf_overrides(hf_config):
       window is enforced exactly by the two-pass attention instead.
     """
     hf_config.is_encoder_decoder = False
-    decoder_config = hf_config.decoder
+    decoder_config = getattr(hf_config, "decoder", None)
+    if decoder_config is None:
+        # vLLM probes the hf_overrides callable with a dummy bare
+        # PreTrainedConfig just to read model_type (transformers_utils/
+        # config.py) BEFORE loading the real config; probe mutations are
+        # discarded.  The real T5Gemma2 config (which has .decoder) gets
+        # the full treatment on the second call.
+        return hf_config
     if not hasattr(decoder_config, SLIDING_WINDOW_STASH_ATTR):
         setattr(
             decoder_config,
