@@ -1,5 +1,20 @@
 # Evaluation Scripts
 
+## T5Gemma2 Speed Benchmark
+
+Measures the plugin's speed-up over HuggingFace transformers (which has no
+FlashAttention path for T5Gemma2 — transformers issue #45522). Reports
+prefill latency, end-to-end latency, and decode tokens/s per stack, plus a
+vLLM-vs-best-HF speed-up summary. Theory and expected results:
+`docs/t5gemma2_flash_attention_theory.md`.
+
+```bash
+# within the sliding window (short mode):
+python bench_t5gemma2.py
+# beyond the window (long mode, two-pass FlashAttention, bfloat16):
+python bench_t5gemma2.py --long-context --enc-lens 768 1536 3072
+```
+
 ## CNN/DailyMail Evaluation
 
 ### Install Dependencies

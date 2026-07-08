@@ -147,6 +147,20 @@ limitations: total context capped at the decoder sliding window
 most one image per request), no prefix caching.  See
 `example_t5gemma2_usage.py` and `scripts/parity_t5gemma2.py` (`--image`).
 
+Note on FlashAttention: HuggingFace transformers rejects
+`attn_implementation="flash_attention_2"` for T5Gemma2 (the merged
+attention has no FA formulation upstream — see
+[transformers#45522](https://github.com/huggingface/transformers/issues/45522)).
+This plugin's reduction is exactly such a formulation: short mode runs on
+vLLM's stock paged attention (any backend — FlashAttention, FlashInfer,
+Triton), and long mode runs merged attention as two FlashAttention calls
+combined with an exact LSE merge (FLASH_ATTN backend required — the two
+passes need FlashAttention's log-sum-exp return; a FlashInfer port is
+possible since FlashInfer exposes LSEs too).  Formal correctness proofs,
+complexity analysis, and the expected speed-up model are in
+`docs/t5gemma2_flash_attention_theory.md`; measure on your hardware with
+`scripts/bench_t5gemma2.py` (see `scripts/README.md`).
+
 Numerical parity vs HuggingFace (`scripts/parity_t5gemma2.py --image`, and
 `--dtype float32` for the low-noise variant): greedy decoding is token-exact
 in float32, and teacher-forced logprobs agree to a measured, deterministic
